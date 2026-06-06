@@ -918,5 +918,15 @@
     "name": "utils",
     "source_hint": "tools/utils.ts",
     "responsibility": "Tool module mirrored from archived TypeScript path tools/utils.ts"
+  },
+  {
+    "name": "run_subagent",
+    "source_hint": "rust/crates/tools/src/subagent_mcp.rs",
+    "responsibility": "MCP tool: run a bounded local/OpenRouter sub-agent (provider+model+prompt) and return status/summary/diff"
+  },
+  {
+    "name": "list_presets",
+    "source_hint": "rust/crates/tools/src/subagent_mcp.rs",
+    "responsibility": "MCP tool: list available sub-agent presets (name/description/provider/model)"
   }
 ]

@@ -3483,7 +3483,7 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
 }
 
 /// Default model for background sub-agents (the `Agent` tool and the
-/// `run_subagent` MCP tool). DeepSeek via OpenRouter — overridable per-call or
+/// `run_subagent` MCP tool). `DeepSeek` via `OpenRouter` — overridable per-call or
 /// with the `CLAW_SUBAGENT_MODEL` env var.
 const DEFAULT_AGENT_MODEL: &str = "deepseek/deepseek-v4-pro";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
