@@ -43,8 +43,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  test-rusty-claude-cli:
-    name: cargo test -p rusty-claude-cli
+  test:
+    name: cargo test (maintained crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,5 +52,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
-      - name: Run crate tests
-        run: cargo test -p rusty-claude-cli
+      # Scoped to the crates this fork actively maintains (adds `tools`, which
+      # carries the new run_subagent/jail tests, to the prior `rusty-claude-cli`
+      # coverage). A full `--workspace` run is deferred: the `runtime` suite has
+      # pre-existing parallel test-isolation flakiness (shared global state ->
+      # nondeterministic failures) that must be fixed before it can gate CI.
+      - name: Run tests (maintained crates)
+        run: cargo test -p rusty-claude-cli -p tools

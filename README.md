@@ -137,7 +137,7 @@ The `claw setup` subcommand configures and launches provider-specific sessions:
 - Launches claw with the selected model
 
 **`claw setup openrouter [model]`**
-- Manages API key in `~/.config/opencode/.env`
+- Manages API key in `~/.config/openroutercode/.env` (falls back to the legacy `~/.config/opencode/.env` for existing users)
 - Fetches the tool-capable model catalog from OpenRouter
 - Sets `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, `CLAW_RESILIENCE=none`
 - Launches claw with the selected model
@@ -150,7 +150,189 @@ The install.sh script also deploys standalone shell launchers to `~/.local/bin/`
 |---|---|
 | `lmcode` | LM Studio — auto-discovery, model list, config save |
 | `ollamacode` | Ollama — server management, model TUI, context length detection |
-| `opencode` | OpenRouter — 300+ model browser with pagination and filter chaining |
+| `openroutercode` | OpenRouter — 300+ model browser with pagination and filter chaining |
+
+See [docs/local-openai-compatible-providers.md](docs/local-openai-compatible-providers.md) for a full walkthrough of OpenAI-compatible routing, the `claw doctor` reachability check, `CLAW_RESILIENCE`, `extra_body`, and the launchers.
+
+See the next section for a complete, step-by-step walkthrough of wiring claw-code into Claude Code (or OpenClaw) as a sub-agent.
+
+---
+
+## Setup Guide: claw-code as a Sub-Agent for Claude Code & OpenClaw
+
+### The mental model
+
+Claude Code (running Sonnet) stays the **orchestrator**. claw-code becomes a cheap, sandboxed **sub-agent** it calls through a single MCP tool — `run_subagent` — to offload bulk coding work to a **local model** or an **OpenRouter model** (DeepSeek by default). You delegate to save Sonnet tokens and/or to run fully local, and you get back a **bounded result** (status + summary + diff stat), never the sub-agent's transcript.
+
+`claw mcp serve` is the bridge: a stdio MCP server that exposes exactly two tools — `run_subagent` and `list_presets`.
+
+### Step 1 — Install
+
+```bash
+git clone https://github.com/wadebalsamo/claw-code-local-subagent.git
+cd claw-code-local-subagent
+./install.sh
+```
+
+`install.sh` builds the `claw` binary and then runs the Rust-native `claw install` subcommand, which writes the launcher shortcuts (`claw`, `lmcode`, `ollamacode`, `openroutercode`, `run-claw-code`) into `~/.local/bin/` with the repo root embedded — no shell `sed` hacks. Make sure `~/.local/bin` is on your `PATH`, then confirm:
+
+```bash
+claw --version
+```
+
+### Step 2 — Choose the sub-agent's model backend
+
+Point the sub-agent at OpenRouter (simplest) or a local server. You can configure several — `run_subagent` takes a `provider` per call.
+
+#### Option A — OpenRouter (cloud, default)
+
+1. Create an OpenRouter API key.
+2. Store it (either works):
+   - `claw setup openrouter` — interactive; saves the key to `~/.config/openroutercode/.env`, **or**
+   - export it for the session: `export OPENROUTER_API_KEY=sk-or-...`
+3. The default sub-agent model is `deepseek/deepseek-v4-pro` — cheap and tool-capable. Use `deepseek/deepseek-v4-flash` for a lighter/faster option, or any tool-capable OpenRouter model. Override globally with `CLAW_SUBAGENT_MODEL`, or per call with the `model` field.
+
+#### Option B — Local: Ollama
+
+1. Install Ollama and pull a **tool-capable** model (it must support function/tool calling to act as an agent):
+   ```bash
+   ollama pull qwen3:14b
+   ollama serve            # if not already running (serves http://localhost:11434)
+   ```
+2. (Optional) Keep the model warm between calls so each delegated task doesn't pay reload latency:
+   ```bash
+   export OLLAMA_KEEP_ALIVE=30m
+   ```
+3. The sub-agent reaches Ollama at `http://localhost:11434/v1` automatically when you call it with `provider: "ollama"` (or `"local"`).
+
+#### Option C — Local: LM Studio
+
+1. In LM Studio, load a **tool-capable** model and start the local server (defaults to `http://localhost:1234`).
+2. Call the sub-agent with `provider: "lmstudio"` and the loaded model's id.
+
+> **Tool-calling is mandatory.** A plain chat model can answer questions but cannot read/edit files or run commands, so it cannot function as a coding sub-agent. Choose a model whose card advertises tools/function-calling.
+
+### Step 3 — Verify the backend before wiring it in
+
+```bash
+# Reachability + environment check (includes the OPENAI_BASE_URL probe)
+claw doctor
+
+# Quick interactive smoke test of the backend you chose:
+openroutercode                      # OpenRouter — model browser + chat
+ollamacode --model qwen3:14b        # Ollama
+lmcode                              # LM Studio (auto-discovers the server)
+```
+
+If `claw doctor` reports the endpoint reachable and a smoke chat works, the backend is ready.
+
+### Step 4 — Register claw-code as an MCP sub-agent in Claude Code
+
+`claw mcp serve` is the server Claude Code spawns. Register it once:
+
+**OpenRouter:**
+```bash
+claude mcp add claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve
+```
+
+**Local (Ollama / LM Studio)** — no key needed; just keep the local server running:
+```bash
+claude mcp add claw-subagents -- claw mcp serve
+```
+
+**Project-scoped** (commit to share with a repo) — `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "claw-subagents": {
+      "command": "claw",
+      "args": ["mcp", "serve"],
+      "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
+    }
+  }
+}
+```
+
+Confirm inside Claude Code with `/mcp` — you should see `claw-subagents` exposing `run_subagent` and `list_presets`.
+
+**How the env flows:** Claude Code launches `claw mcp serve` as a child process and injects the `--env` (or `.mcp.json` `env`) values into it. Inside, `run_subagent` reads `OPENROUTER_API_KEY` (or the `~/.config/openroutercode/.env` → `~/.config/opencode/.env` fallback) for OpenRouter; for local providers it sets the localhost base URL itself.
+
+### Step 5 — Delegate work to the sub-agent from Claude Code
+
+Ask Claude Code to use the tool, or it calls `mcp__claw-subagents__run_subagent` directly. The only required field is `prompt`.
+
+**OpenRouter (uses the DeepSeek default):**
+```json
+{
+  "prompt": "Add input validation to src/api/users.rs and a unit test for it",
+  "repo_dir": "/abs/path/to/repo"
+}
+```
+
+**Local Ollama (explicit model required):**
+```json
+{
+  "provider": "ollama",
+  "model": "qwen3:14b",
+  "prompt": "Refactor the parser module to return Result instead of panicking",
+  "repo_dir": "/abs/path/to/repo",
+  "permission_mode": "workspace-write"
+}
+```
+
+Full input: `prompt` (required) plus optional `provider` (`local|openrouter|ollama|lmstudio|anthropic|openai|auto`), `model`, `repo_dir`, `subagent_type`, `permission_mode` (`read-only|workspace-write|danger-full-access`), `isolated`, `timeout_secs`, `max_output_chars`. The tool returns compact JSON — `status` (`completed|failed|timeout`), `summary`, `diff_stat`, `model`, `duration_ms` — and **never** the sub-agent's transcript. Failures and timeouts are encoded in `status`/`error`, not raised as transport errors. Claude Code reads the summary + diff stat, inspects the changed files in `repo_dir`, and decides what to keep.
+
+Provider notes:
+- `provider: "local" | "ollama" | "lmstudio"` requires the local server running **and** an explicit `model` (there is no local default).
+- `provider: "anthropic"` requires `ANTHROPIC_API_KEY` and an explicit Claude `model`.
+- with no `model`, the sub-agent uses the DeepSeek default via OpenRouter.
+
+Discover ready-made (provider, model, system-prompt) bundles with the `list_presets` tool (sourced from `scripts/presets/` and `~/.lmcode/presets/`).
+
+**Two execution modes:**
+- **Default (in-process):** fast; the sub-agent edits files directly in `repo_dir`. The MCP server processes calls one at a time.
+- **`isolated: true` (with a `preset`):** runs through `run-claw-code` in a throwaway **git worktree** with a hard kill-on-timeout and a captured `diff.patch` — use it for long/untrusted tasks, or when you want GPU scheduling (below).
+
+### Resource management for local GPUs
+
+Local inference is VRAM-bound, and that shapes how you run local sub-agents:
+
+- **One GPU usually holds one model.** Firing several local sub-agents at the same GPU forces the server to swap models (slow) or run out of VRAM. Plan for **one resident model per GPU**.
+- **A single Claude Code session is already serialized.** The MCP server processes `run_subagent` calls **one at a time**, so one Claude Code session won't fan out concurrent GPU hits through a given `claw mcp serve`.
+- **For fleets / multiple orchestrators, use the named-resource scheduler.** Concurrency across *different* agents is where GPUs collide. Tag work to a named resource and the scheduler serializes it with `flock`:
+  ```bash
+  run-claw-code --agent dev-backend --dir /repo --plan "..." \
+    --resource 3090-vram --max-parallel 1
+  ```
+  All tasks tagged `3090-vram` are serialized (cap = how many models fit in VRAM, usually `1`), while a task on a different resource (e.g. `cpu-rag`) runs concurrently. From Claude Code you reach this path via `run_subagent` with `isolated: true` and a preset whose `resource_type` is a GPU lane (`gpu-exclusive`, `gpu-em`, `gpu-overflow`), or by calling `run-claw-code` directly. See [Named-Resource Scheduling](#named-resource-scheduling).
+- **Keep models warm:** `OLLAMA_KEEP_ALIVE=30m` avoids paying model-load latency on every delegated task.
+- **Leave resilience on for local:** `CLAW_RESILIENCE` auto-enables for localhost endpoints (force it with `CLAW_RESILIENCE=force`). It converts GPU warm-up stalls and model-unload blips into automatic retries instead of hard failures — see [Resilience and Self-Healing](#resilience-and-self-healing).
+
+**Rule of thumb:** one physical GPU → one resource name → `--max-parallel 1`, one resident model, keep-alive on, resilience on.
+
+### Providing claw-code as a tool to OpenClaw agents
+
+OpenClaw is the orchestration system this fork was built for. There are two ways to give it claw-code as a sub-agent; both preserve the bounded-output contract.
+
+**Mode 1 — MCP tool (interactive, single result).** If your OpenClaw agent speaks MCP, register `claw mcp serve` exactly as in Step 4 and call `run_subagent` / `list_presets`. Best when the orchestrator wants one delegated result inline and lets claw manage provider/model.
+
+**Mode 2 — `run-claw-code` CLI contract (fleets, GPU scheduling, PRs).** The original design, and the better fit for many concurrent agents. OpenClaw shells out:
+```bash
+run-claw-code --agent <preset> --dir <repo> --plan "<task>" \
+  --resource <gpu-name> --max-parallel <N> \
+  [--timeout <seconds>] [--pr-into <base-branch>] [--sprint-id <id>]
+```
+and reads the deterministic return contract:
+```
+task_id=<uuid>
+/tmp/claw-runs/<uuid>/status.json
+/tmp/claw-runs/<uuid>/diff.patch
+/tmp/claw-runs/<uuid>/summary.md
+# plus pr_request.json when --pr-into is set
+```
+This path layers on what fleet orchestration needs beyond `run_subagent`: git-worktree isolation, hard kill-on-timeout, the `flock` GPU scheduler, and optional PR creation (`--pr-into`) and sprint manifests (`--sprint-id`). The orchestrator polls `status.json`, reads `summary.md`, applies `diff.patch` — never ingesting the transcript. Presets (`scripts/presets/`, or per-user `~/.lmcode/presets/`) carry the provider/model/permission/`resource_type`, so the OpenClaw side only picks a preset and a task.
+
+**Which to use:** MCP `run_subagent` for interactive, one-off delegation (Claude Code, or an MCP-native OpenClaw agent); `run-claw-code` for batch/parallel fleets that need GPU scheduling and PR automation.
 
 ---
 
@@ -286,7 +468,7 @@ This fork is under active development. The features listed below are verified im
 
 ### In Active Integration
 
-- **TUI/fzf model browser for `setup openrouter`** — The shell launcher (`opencode`) has this via external scripts. The native `claw setup openrouter` command currently accepts model names directly; a TUI model selector is a planned enhancement.
+- **TUI/fzf model browser for `setup openrouter`** — The shell launcher (`openroutercode`) has this via external scripts. The native `claw setup openrouter` command currently accepts model names directly; a TUI model selector is a planned enhancement.
 - **Provider-specific request serialization refinements** — Per-base-url functions are in place; broader coverage for additional local inference server variants is ongoing.
  
 ---

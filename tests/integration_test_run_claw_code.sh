@@ -182,7 +182,7 @@ assert_success "claw respects environment setup"
 # ============================================================================
 log_test "Install script creates correct symlinks"
 # After install.sh, these should exist
-expected_bins=("claw" "lmcode" "ollamacode" "opencode" "run-claw-code")
+expected_bins=("claw" "lmcode" "ollamacode" "openroutercode" "run-claw-code")
 for bin in "${expected_bins[@]}"; do
     [ -f "$REPO_ROOT/scripts/launchers/${bin}.sh" ] || [ -x "$CLAW_BIN" ]
 done

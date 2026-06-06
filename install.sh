@@ -2,7 +2,7 @@
 # Claw Code installer
 #
 # Builds the `claw` binary from the `rust/` workspace and installs
-# the launcher shortcuts (lmcode, ollamacode, opencode, run-claw-code)
+# the launcher shortcuts (lmcode, ollamacode, openroutercode, run-claw-code)
 # to ~/.local/bin/.
 #
 # Usage:
@@ -336,47 +336,14 @@ ok "built ${CLAW_BIN}"
 
 step "Installing launcher shortcuts"
 
-LAUNCHER_DIR="${SCRIPT_DIR}/scripts/launchers"
 INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "${INSTALL_DIR}"
 
-LAUNCHER_MAP=(
-    "lmcode.sh:lmcode"
-    "ollamacode.sh:ollamacode"
-    "opencode.sh:opencode"
-    "run-claw-code.sh:run-claw-code"
-)
-
-INSTALLED=0
-for entry in "${LAUNCHER_MAP[@]}"; do
-    src="${LAUNCHER_DIR}/${entry%%:*}"
-    name="${entry##*:}"
-    dest="${INSTALL_DIR}/${name}"
-
-    if [ ! -f "${src}" ]; then
-        warn "launcher not found: ${src}"
-        continue
-    fi
-
-    cp "${src}" "${dest}"
-    # Embed the repo root path into the launcher script by adding CLAW_CODE_ROOT export early
-    sed -i "6a export CLAW_CODE_ROOT=\"${SCRIPT_DIR}\"" "${dest}"
-    chmod 755 "${dest}"
-    ok "installed ${dest}"
-    INSTALLED=$((INSTALLED + 1))
-done
-
-# Install direct 'claw' shortcut
-CLAW_DEST="${INSTALL_DIR}/claw"
-cat > "${CLAW_DEST}" <<EOF
-#!/usr/bin/env bash
-exec "${CLAW_BIN}" "\$@"
-EOF
-chmod 755 "${CLAW_DEST}"
-ok "installed ${CLAW_DEST}"
-INSTALLED=$((INSTALLED + 1))
-
-info "${INSTALLED} launchers installed to ${INSTALL_DIR}"
+# The launcher shortcuts (claw, lmcode, ollamacode, openroutercode,
+# run-claw-code) are now written by the Rust-native `claw install` subcommand.
+# It embeds the launcher bodies at compile time, injects CLAW_CODE_ROOT, and
+# synthesizes the `claw` shim — replacing the old cp + `sed` loop and heredoc.
+"${CLAW_BIN}" install --repo-root "${SCRIPT_DIR}"
 
 # Check if install dir is on PATH
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
@@ -423,7 +390,7 @@ ${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
 
   Binary:   ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
   Profile:  ${BUILD_PROFILE}
-  Shortcuts: ${INSTALL_DIR}/{claw,lmcode,ollamacode,opencode,run-claw-code}
+  Shortcuts: ${INSTALL_DIR}/{claw,lmcode,ollamacode,openroutercode,run-claw-code}
 
 Try it out:
 
@@ -437,7 +404,7 @@ Try it out:
   ollamacode --model qwen3:27b
 
   ${COLOR_DIM}# OpenRouter${COLOR_RESET}
-  opencode
+  openroutercode
 
   ${COLOR_DIM}# Sub-agent entry point${COLOR_RESET}
   run-claw-code --agent dev-frontend --dir /path/to/repo --plan "fix the bug"

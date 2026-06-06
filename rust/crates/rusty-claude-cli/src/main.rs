@@ -8,6 +8,7 @@
 )]
 mod init;
 mod input;
+mod install;
 mod render;
 mod setup;
 
@@ -53,9 +54,7 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
-};
+use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
@@ -498,6 +497,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        CliAction::Install {
+            install_dir,
+            repo_root,
+            force,
+            output_format,
+        } => install::run_install(install_dir, repo_root, force, output_format)?,
     }
     Ok(())
 }
@@ -602,6 +607,12 @@ enum CliAction {
     Setup {
         target: setup::SetupTarget,
         model: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Install {
+        install_dir: Option<PathBuf>,
+        repo_root: Option<PathBuf>,
+        force: bool,
         output_format: CliOutputFormat,
     },
     HelpTopic(LocalHelpTopic),
@@ -1032,6 +1043,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "setup" => parse_setup_args(&rest[1..], output_format),
+        "install" => parse_install_args(&rest[1..], output_format),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -1318,6 +1330,49 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
     }
 }
 
+/// Parse `claw install` flags: `--dir <path>` (install directory),
+/// `--repo-root <path>` (override repo-root detection), `--force`. Unknown
+/// arguments are rejected with a clear error, mirroring `parse_acp_args`.
+fn parse_install_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut install_dir: Option<PathBuf> = None;
+    let mut repo_root: Option<PathBuf> = None;
+    let mut force = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("`claw install --dir` requires a path argument"))?;
+                install_dir = Some(PathBuf::from(value));
+            }
+            "--repo-root" => {
+                let value = iter.next().ok_or_else(|| {
+                    String::from("`claw install --repo-root` requires a path argument")
+                })?;
+                repo_root = Some(PathBuf::from(value));
+            }
+            "--force" => force = true,
+            other => {
+                return Err(format!(
+                    "unsupported `claw install` argument: {other}. Use `--dir <path>`, `--repo-root <path>`, or `--force`."
+                ));
+            }
+        }
+    }
+
+    Ok(CliAction::Install {
+        install_dir,
+        repo_root,
+        force,
+        output_format,
+    })
+}
+
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
     let looks_like_skill_name = !bare_first_token.is_empty()
@@ -1492,6 +1547,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "system-prompt",
         "acp",
         "init",
+        "install",
         "export",
         "prompt",
     ];
@@ -2129,6 +2185,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     Ok(DoctorReport {
         checks: vec![
             check_auth_health(),
+            check_openai_base_url_health(),
             check_config_health(&config_loader, config.as_ref()),
             check_install_source_health(),
             check_workspace_health(&context),
@@ -2153,15 +2210,10 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Starts a minimal Model Context Protocol server that exposes claw's
-/// built-in tools over stdio.
-///
-/// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
-/// dispatched through [`tools::execute_tool`], so this server exposes exactly
 /// Read `.claw/worker-state.json` from the current working directory and print it.
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
 /// atomically writes state transitions here so external observers (clawhip, orchestrators)
-/// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
+/// can poll current `WorkerStatus` without needing an HTTP route on the claw binary.
 fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
@@ -2196,25 +2248,38 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// the same surface the in-process agent loop uses.
-fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
-    let tools = mvp_tool_specs()
-        .into_iter()
-        .map(|spec| McpTool {
-            name: spec.name.to_string(),
-            description: Some(spec.description.to_string()),
-            input_schema: Some(spec.input_schema),
-            annotations: None,
-            meta: None,
-        })
-        .collect();
+/// Convert a tools-crate [`tools::ToolSpec`] into the runtime [`McpTool`]
+/// descriptor advertised over `tools/list`.
+fn tool_spec_to_mcp_tool(spec: tools::ToolSpec) -> McpTool {
+    McpTool {
+        name: spec.name.to_string(),
+        description: Some(spec.description.to_string()),
+        input_schema: Some(spec.input_schema),
+        annotations: None,
+        meta: None,
+    }
+}
 
-    let spec = McpServerSpec {
-        server_name: "claw".to_string(),
+/// Build the curated `claw mcp serve` spec: a purpose-built `run_subagent` +
+/// `list_presets` pair (instead of the entire raw toolbox), dispatched through
+/// [`tools::handle_subagent_mcp_call`].
+fn build_subagent_mcp_spec() -> McpServerSpec {
+    let tools = vec![
+        tool_spec_to_mcp_tool(tools::run_subagent_tool_spec()),
+        tool_spec_to_mcp_tool(tools::list_presets_tool_spec()),
+    ];
+    McpServerSpec {
+        server_name: "claw-subagents".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
-    };
+        tool_handler: Box::new(tools::handle_subagent_mcp_call),
+    }
+}
+
+/// Run `claw mcp serve`: an stdio MCP server exposing the curated sub-agent
+/// tools so a parent agent can spawn local/OpenRouter sub-agents.
+fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = build_subagent_mcp_spec();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2329,6 +2394,198 @@ fn check_auth_health() -> DiagnosticCheck {
             ("legacy_scopes".to_string(), Value::Null),
             ("legacy_saved_oauth_error".to_string(), json!(error.to_string())),
         ])),
+    }
+}
+
+/// Parse an `OPENAI_BASE_URL` value into `(host, port, scheme)` for a TCP
+/// reachability probe.
+///
+/// This is intentionally dependency-light: it does NOT pull in the `url`
+/// crate, because the doctor probe only needs the authority (`host:port`) to
+/// open a socket. The path (e.g. `/v1`) is irrelevant for a TCP connect.
+///
+/// Rules:
+/// - Scheme is read from a leading `http://` / `https://` (case-insensitive);
+///   absent scheme defaults to `http` (local servers like LM Studio/Ollama).
+/// - Port defaults from the scheme when not explicit: 443 for https, 80 for
+///   http.
+/// - Bracketed IPv6 authorities (`[::1]:1234`) are supported.
+///
+/// Returns `None` when no host can be extracted (e.g. empty/garbage input).
+fn parse_base_url_host_port(base_url: &str) -> Option<(String, u16, String)> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Split off an optional scheme. We lower-case only the scheme so the host
+    // (which may matter for SNI elsewhere) is preserved verbatim.
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("http".to_string(), trimmed),
+    };
+    let scheme = if scheme.is_empty() {
+        "http".to_string()
+    } else {
+        scheme
+    };
+
+    // The authority ends at the first `/`, `?`, or `#`.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .trim_end_matches('/');
+    // Strip any embedded userinfo (`user:pass@host`).
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    if authority.is_empty() {
+        return None;
+    }
+
+    let default_port = if scheme == "https" { 443 } else { 80 };
+
+    // IPv6 literal authority: `[::1]` or `[::1]:1234`.
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, after_host) = after_bracket.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = after_host
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_string(), port, scheme));
+    }
+
+    // IPv4 / hostname authority, optionally `host:port`.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port_str)) => {
+            // Only treat the trailing segment as a port if it parses; this
+            // guards against a stray colon producing an empty host.
+            match port_str.parse::<u16>() {
+                Ok(port) if !host.is_empty() => (host.to_string(), port),
+                _ => (authority.to_string(), default_port),
+            }
+        }
+        None => (authority.to_string(), default_port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, scheme))
+}
+
+/// #(local-providers): when `OPENAI_BASE_URL` points at a local or custom
+/// OpenAI-compatible endpoint (LM Studio, Ollama, OpenRouter, vLLM, …), a
+/// down server or a typo'd URL is one of the most common reasons the fork
+/// "hangs" or fails the first turn. This check does a bounded TCP reachability
+/// probe so `claw doctor` can say plainly "your local server looks down"
+/// instead of leaving users to debug a connection timeout mid-request.
+///
+/// When `OPENAI_BASE_URL` is unset this is a no-op `ok` check (the default
+/// Anthropic path is covered by `check_auth_health`), so it never fails a
+/// vanilla setup. The probe is `std::net` only and capped at ~2s so doctor
+/// never blocks.
+fn check_openai_base_url_health() -> DiagnosticCheck {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let base_url = env::var("OPENAI_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let Some(base_url) = base_url else {
+        return DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Ok,
+            "OPENAI_BASE_URL is not set; using the default Anthropic endpoint",
+        )
+        .with_details(vec![
+            "Local provider    inactive (set OPENAI_BASE_URL or run `claw setup ollama|lmstudio|openrouter`)"
+                .to_string(),
+        ])
+        .with_data(Map::from_iter([
+            ("configured".to_string(), json!(false)),
+            ("base_url".to_string(), Value::Null),
+            ("reachable".to_string(), Value::Null),
+        ]));
+    };
+
+    let Some((host, port, scheme)) = parse_base_url_host_port(&base_url) else {
+        return DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Fail,
+            format!("OPENAI_BASE_URL is set but could not be parsed: {base_url}"),
+        )
+        .with_details(vec![
+            format!("Configured URL    {base_url}"),
+            "Suggested action  expected a URL like http://localhost:1234/v1; re-run `claw setup`"
+                .to_string(),
+        ])
+        .with_data(Map::from_iter([
+            ("configured".to_string(), json!(true)),
+            ("base_url".to_string(), json!(base_url)),
+            ("parsed".to_string(), json!(false)),
+            ("reachable".to_string(), json!(false)),
+        ]));
+    };
+
+    let endpoint = format!("{host}:{port}");
+    let timeout = Duration::from_secs(2);
+
+    // Resolve then connect with a bounded timeout. DNS resolution itself can
+    // block, but for the local-provider case (localhost/127.0.0.1) it is
+    // effectively instant; the connect_timeout caps the TCP handshake.
+    let resolve = endpoint.to_socket_addrs();
+    let (reachable, probe_note) = match resolve {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(_stream) => (true, format!("connected to {addr}")),
+                Err(error) => (false, format!("connect failed: {error}")),
+            },
+            None => (false, "address resolved to no socket addresses".to_string()),
+        },
+        Err(error) => (false, format!("could not resolve {endpoint}: {error}")),
+    };
+
+    let base_data = Map::from_iter([
+        ("configured".to_string(), json!(true)),
+        ("base_url".to_string(), json!(base_url)),
+        ("parsed".to_string(), json!(true)),
+        ("scheme".to_string(), json!(scheme)),
+        ("host".to_string(), json!(host)),
+        ("port".to_string(), json!(port)),
+        ("endpoint".to_string(), json!(endpoint)),
+        ("reachable".to_string(), json!(reachable)),
+    ]);
+
+    if reachable {
+        DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Ok,
+            format!("local OpenAI-compatible endpoint is reachable at {endpoint}"),
+        )
+        .with_details(vec![
+            format!("Configured URL    {base_url}"),
+            format!("Resolved endpoint {endpoint} ({scheme})"),
+            format!("Probe             {probe_note}"),
+        ])
+        .with_data(base_data)
+    } else {
+        DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Warn,
+            format!("OPENAI_BASE_URL is set but {endpoint} is not reachable"),
+        )
+        .with_details(vec![
+            format!("Configured URL    {base_url}"),
+            format!("Resolved endpoint {endpoint} ({scheme})"),
+            format!("Probe             {probe_note}"),
+            "Likely cause      the local server (LM Studio / Ollama / OpenRouter) may be down, or the URL is wrong"
+                .to_string(),
+            "Suggested action  start the server, or re-run `claw setup ollama|lmstudio|openrouter`"
+                .to_string(),
+        ])
+        .with_data(base_data)
     }
 }
 
@@ -5250,9 +5507,10 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
-        // tools. All other `mcp` subcommands fall through to the existing
-        // configured-server reporter (`list`, `status`, ...).
+        // `claw mcp serve` starts a stdio MCP server exposing the curated
+        // sub-agent tools (`run_subagent`, `list_presets`). All other `mcp`
+        // subcommands fall through to the existing configured-server reporter
+        // (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
             return run_mcp_serve();
         }
@@ -9411,6 +9669,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw init")?;
     writeln!(
         out,
+        "  claw install [--dir PATH] [--repo-root PATH] [--force]"
+    )?;
+    writeln!(
+        out,
+        "      Install launcher shortcuts (claw, lmcode, ollamacode, openroutercode, run-claw-code) to ~/.local/bin"
+    )?;
+    writeln!(
+        out,
         "  claw export [PATH] [--session SESSION] [--output PATH]"
     )?;
     writeln!(
@@ -9498,6 +9764,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw install")?;
     writeln!(out, "  claw export")?;
     writeln!(out, "  claw export conversation.md")?;
     Ok(())
@@ -10660,6 +10927,42 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn parses_install_command_flags() {
+        assert_eq!(
+            parse_args(&["install".to_string()]).expect("bare install should parse"),
+            CliAction::Install {
+                install_dir: None,
+                repo_root: None,
+                force: false,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "install".to_string(),
+                "--dir".to_string(),
+                "/x".to_string(),
+                "--repo-root".to_string(),
+                "/y".to_string(),
+                "--force".to_string(),
+            ])
+            .expect("install with flags should parse"),
+            CliAction::Install {
+                install_dir: Some(PathBuf::from("/x")),
+                repo_root: Some(PathBuf::from("/y")),
+                force: true,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        let unknown = parse_args(&["install".to_string(), "--bogus".to_string()])
+            .expect_err("unknown install arg should error");
+        assert!(unknown.contains("--bogus"), "{unknown}");
+        let missing_value = parse_args(&["install".to_string(), "--dir".to_string()])
+            .expect_err("--dir without value should error");
+        assert!(missing_value.contains("--dir"), "{missing_value}");
     }
 
     #[test]
@@ -12071,6 +12374,7 @@ mod tests {
         assert!(help.contains("claw status"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
+        assert!(help.contains("claw install"));
         assert!(help.contains("claw acp [serve]"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
@@ -13775,7 +14079,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{format_sandbox_report, parse_base_url_host_port, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -13826,6 +14130,71 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn parse_base_url_host_port_defaults_scheme_and_port() {
+        // No scheme -> http, default port 80, path stripped.
+        assert_eq!(
+            parse_base_url_host_port("localhost/v1"),
+            Some(("localhost".to_string(), 80, "http".to_string()))
+        );
+        // http scheme, explicit port, path stripped.
+        assert_eq!(
+            parse_base_url_host_port("http://localhost:1234/v1"),
+            Some(("localhost".to_string(), 1234, "http".to_string()))
+        );
+        // https scheme defaults to 443 when port absent.
+        assert_eq!(
+            parse_base_url_host_port("https://openrouter.ai/api/v1"),
+            Some(("openrouter.ai".to_string(), 443, "https".to_string()))
+        );
+        // Explicit https port is honored.
+        assert_eq!(
+            parse_base_url_host_port("https://example.com:8443"),
+            Some(("example.com".to_string(), 8443, "https".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_base_url_host_port_handles_ipv4_ipv6_and_userinfo() {
+        // IPv4 with port (typical Ollama).
+        assert_eq!(
+            parse_base_url_host_port("http://127.0.0.1:11434/v1"),
+            Some(("127.0.0.1".to_string(), 11434, "http".to_string()))
+        );
+        // IPv6 literal with port.
+        assert_eq!(
+            parse_base_url_host_port("http://[::1]:1234/v1"),
+            Some(("::1".to_string(), 1234, "http".to_string()))
+        );
+        // IPv6 literal without port falls back to scheme default.
+        assert_eq!(
+            parse_base_url_host_port("https://[::1]/v1"),
+            Some(("::1".to_string(), 443, "https".to_string()))
+        );
+        // Userinfo is stripped from the authority.
+        assert_eq!(
+            parse_base_url_host_port("http://user:pass@host.example:9000/v1"),
+            Some(("host.example".to_string(), 9000, "http".to_string()))
+        );
+        // Scheme casing is normalized.
+        assert_eq!(
+            parse_base_url_host_port("HTTPS://Example.com"),
+            Some(("Example.com".to_string(), 443, "https".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_base_url_host_port_rejects_empty_or_hostless() {
+        assert_eq!(parse_base_url_host_port(""), None);
+        assert_eq!(parse_base_url_host_port("   "), None);
+        assert_eq!(parse_base_url_host_port("http://"), None);
+        // A bare port with no host should not yield an empty host.
+        assert_eq!(
+            parse_base_url_host_port("http://:8080"),
+            Some((":8080".to_string(), 80, "http".to_string()))
+        );
     }
 }
 

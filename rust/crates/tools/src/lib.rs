@@ -3321,6 +3321,11 @@ fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::pa
     );
     push_skill_lookup_root(
         roots,
+        home.join(".config").join("openroutercode").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
         home.join(".config").join("opencode").join("skills"),
         SkillLookupOrigin::SkillsDir,
     );
@@ -3477,7 +3482,10 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+/// Default model for background sub-agents (the `Agent` tool and the
+/// `run_subagent` MCP tool). `DeepSeek` via `OpenRouter` — overridable per-call or
+/// with the `CLAW_SUBAGENT_MODEL` env var.
+const DEFAULT_AGENT_MODEL: &str = "deepseek/deepseek-v4-pro";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -3639,11 +3647,18 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    // Precedence: explicit per-call model > CLAW_SUBAGENT_MODEL env > default.
+    // Shared by the `Agent` tool and the `run_subagent` MCP tool.
+    if let Some(explicit) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        return explicit.to_string();
+    }
+    if let Ok(env_model) = std::env::var("CLAW_SUBAGENT_MODEL") {
+        let trimmed = env_model.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    DEFAULT_AGENT_MODEL.to_string()
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -3728,10 +3743,21 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
 }
 
 fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-    )
+    agent_permission_policy_for_mode(PermissionMode::DangerFullAccess)
+}
+
+/// Build the sub-agent permission policy with a caller-chosen active mode.
+///
+/// Tool requirements come from [`mvp_tool_specs`] (the same per-tool minimums
+/// the in-process agent loop enforces); `active_mode` sets the ceiling the
+/// sub-agent runs under. Used by the `run_subagent` MCP tool to honor
+/// `permission_mode`.
+fn agent_permission_policy_for_mode(active_mode: PermissionMode) -> PermissionPolicy {
+    mvp_tool_specs()
+        .into_iter()
+        .fold(PermissionPolicy::new(active_mode), |policy, spec| {
+            policy.with_tool_requirement(spec.name, spec.required_permission)
+        })
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -6126,6 +6152,14 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 pub mod lane_completion;
 pub mod pdf_extract;
+mod subagent_mcp;
+pub mod workspace_jail;
+
+pub use subagent_mcp::{
+    apply_provider_env, handle_subagent_mcp_call, list_presets, list_presets_tool_spec,
+    read_openrouter_key, run_subagent, run_subagent_tool_spec, PresetInfo, ProviderEnvGuard,
+    RunSubagentInput, RunSubagentOutput,
+};
 
 #[cfg(test)]
 mod tests {
