@@ -152,6 +152,8 @@ The install.sh script also deploys standalone shell launchers to `~/.local/bin/`
 | `ollamacode` | Ollama — server management, model TUI, context length detection |
 | `openroutercode` | OpenRouter — 300+ model browser with pagination and filter chaining |
 
+See [docs/local-openai-compatible-providers.md](docs/local-openai-compatible-providers.md) for a full walkthrough of OpenAI-compatible routing, the `claw doctor` reachability check, `CLAW_RESILIENCE`, `extra_body`, and the launchers.
+
 ### Using claw as an MCP sub-agent server
 
 `claw mcp serve` runs a stdio MCP server that exposes a purpose-built
