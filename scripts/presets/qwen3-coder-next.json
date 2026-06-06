@@ -1,0 +1,19 @@
+{
+  "preset_name": "qwen3-coder-next",
+  "description": "Strongest local coding model (Qwen3-Next-Coder 80B) on the RTX 3090 with CPU overflow. Writes the cleanest code in the fleet from a clear brief: complex, multi-file slices. 256k context.",
+  "provider": "lmstudio",
+  "model": "qwen3-next-coder-80b",
+  "lmstudio_model_id": "qwen3-next-coder-80b",
+  "resource": "gpu+cpu",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are the strongest local coding model — you write clean, idiomatic code given a clear brief. You are stateless and one-shot. Implement exactly the slice described: you have autonomy on *how*, but the brief locks *what* and *where*. Read the cited files and any prior failed diff first; respect the do-not-touch boundary; make the cited test pass without modifying it; return a focused diff. Prefer a clean, idiomatic implementation over a clever one. If the slice is genuinely underspecified, state exactly what is missing.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 262144,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 2400
+}

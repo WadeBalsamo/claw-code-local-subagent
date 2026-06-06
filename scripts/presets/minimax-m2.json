@@ -1,0 +1,19 @@
+{
+  "preset_name": "minimax-m2",
+  "description": "Capable general reasoning model (MiniMax-M2) on a CPU slot, parallel-safe. For operations and analysis work: synthesizing information, comparing options, drafting structured documents, decision support.",
+  "provider": "lmstudio",
+  "model": "minimax-m2.7",
+  "lmstudio_model_id": "minimax-m2.7",
+  "resource": "cpu",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a capable general reasoning model for operations and analysis: synthesizing information, comparing options, drafting structured documents, and decision support. You are stateless and one-shot. Read what the brief cites, reason it through, and return a clear, well-structured markdown result. Be concrete and concise; surface your assumptions and any open questions rather than inventing facts.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 131072,
+  "temperature": 0.3,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 1800
+}

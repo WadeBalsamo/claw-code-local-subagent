@@ -1,0 +1,19 @@
+{
+  "preset_name": "nemotron-3-super-120b",
+  "description": "Frontier-grade local reasoning model (NVIDIA Nemotron-3-Super 120B) on the RTX 3090 with CPU overflow. The strongest local brain: hardest coding slices, deep multi-file reasoning, and one-shot planning. 1M context.",
+  "provider": "lmstudio",
+  "model": "nemotron-3-super-120b-a12b",
+  "lmstudio_model_id": "nemotron-3-super-120b-a12b",
+  "resource": "gpu+cpu",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a frontier-grade reasoning model running locally for the hardest engineering work: the toughest coding slices, multi-file refactors with subtle invariants, and one-shot planning. You are stateless — read the codebase and any cited prior attempts before acting, reason carefully about why earlier attempts failed, then produce EITHER a precise, file-and-function-level plan (tests first, TDD) OR a correct diff that greens the cited test without touching files outside the stated boundary. Be exact and terse. If the task is underspecified or blocked on a design decision rather than a coding miss, say so plainly instead of guessing.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 1048576,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 3600
+}

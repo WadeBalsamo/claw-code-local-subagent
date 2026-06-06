@@ -1,0 +1,18 @@
+{
+  "preset_name": "deepseek-v4-pro",
+  "description": "Strong cloud reasoning model (DeepSeek-V4-Pro via OpenRouter). The premium remote tier for hard diffs, careful reviews, and audits the local models couldn't crack. The default remote model for run_subagent. Every call is budget-gated.",
+  "provider": "openrouter",
+  "model": "deepseek/deepseek-v4-pro",
+  "resource": "remote",
+  "env": {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"},
+  "system_prompt": "You are a strong cloud reasoning model used for high-stakes work or as a last resort the local models couldn't crack: hard diffs, careful reviews, and audits. You are stateless and one-shot. Read the brief, the failing test, any prior failed attempts, and the cited files; then EITHER produce a correct diff that greens the test, OR — when asked, or when no clean diff exists — a terse markdown audit explaining precisely why prior attempts are stuck and what would unblock the task. Cite file:line; do not expand scope. Tokens are budget-gated — be efficient.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 131072,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 2400
+}

@@ -13,12 +13,11 @@
 #
 # Preset JSON schema (every field is optional):
 #   {
-#     "preset_name": "dev-coder-l0",
-#     "tier_ref": "presets.dev-coder-l0",   # orchestrator key into config/model_tiers.json
+#     "preset_name": "qwen3-coder-30b",
+#     "tier_ref": "presets.<name>",         # optional: orchestrator key into its config/model_tiers.json
 #     "provider": "lmstudio|openrouter|ollama|anthropic|openai|auto",
-#     "model": "qwen3-coder-30b",           # local-first default; the OpenRouter rung is
-#                                           # picked by the orchestrator (budget-gated) and
-#                                           # passed back here via --provider/--model
+#     "model": "qwen3-coder-30b-a3b-q5",    # local-first default; the orchestrator can override
+#                                           # it (budget-gated) via --provider/--model
 #     "lmstudio_model_id": "qwen3-coder-30b-a3b-q5",
 #     "resource": "gpu|cpu|gpu+cpu|remote", # broker slot (RESOURCE_BROKER V3 vocabulary)
 #     "env": { "OPENAI_BASE_URL": "...", "OPENAI_API_KEY": "...", ... },
@@ -105,7 +104,7 @@ for d in paths:
                 continue
         seen.add(name)
         desc = p.get("description", "")
-        rt = p.get("resource_type") or p.get("resource") or ""
+        rt = p.get("resource") or ""
         print(f"  {name:<32} [{rt:<14}] {desc[:80]}")
 PY
 }
@@ -117,9 +116,9 @@ Usage: run-claw-code --agent <preset> --dir <path> --plan <prompt>
        [--resource <name>] [--timeout <sec>] [--max-parallel <N>]
        [--pr-into <base_branch>] [--sprint-id <id>] [--branch <name>] [--help]
 
-  --provider / --model override the preset's local-first defaults. The orchestrator uses
-  them to dispatch a budget-gated OpenRouter rung onto a preset (e.g. dev-coder-l0 on
-  deepseek-v4-flash) without editing the preset. Resolve the rung from config/model_tiers.json.
+  --provider / --model override the preset's local-first default. The orchestrator uses them
+  to run a preset's task on a budget-gated remote rung (e.g. the qwen3-coder-30b preset's task
+  on deepseek-v4-flash) without editing the preset.
 
 Output (4 lines):
   task_id=<uuid>
@@ -141,7 +140,7 @@ Preset JSON schema fields:
   provider              - lmstudio|openrouter|ollama|anthropic|openai|auto (local-first default)
   model                 - local-first model id (overridable with --model)
   lmstudio_model_id     - exact ID for the broker's LMStudio swap
-  resource              - gpu|cpu|gpu+cpu|remote (RESOURCE_BROKER V3 slot; legacy names accepted)
+  resource              - gpu|cpu|gpu+cpu|remote (the broker slot the local model holds)
   env                   - object of env var name:value pairs to set
   plan_mode             - normal|ultraplan|plan-only
   system_prompt         - prepended to the plan text
@@ -240,24 +239,22 @@ print('env applied')
 # ---------------------------------------------------------------------------
 # Extended preset fields (workflow wiring)
 # ---------------------------------------------------------------------------
-RESOURCE_TYPE=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('resource_type') or d.get('resource') or '')" 2>/dev/null || echo "")
+RESOURCE_TYPE=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('resource') or '')" 2>/dev/null || echo "")
 LMSTUDIO_MODEL_ID=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('lmstudio_model_id','') or '')" 2>/dev/null || echo "")
 REQUIRES_FLAG=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('requires_feature_flag','') or '')" 2>/dev/null || echo "")
 MAX_COST_USD=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('max_cost_usd','') or '')" 2>/dev/null || echo "")
 CFO_BUDGET_ENDPOINT=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('cfo_budget_endpoint','') or '')" 2>/dev/null || echo "")
 COMPLETION_WEBHOOK=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('completion_webhook','') or '')" 2>/dev/null || echo "")
 
-# If the preset declares a slot and the caller didn't pass --resource, use it. Map the
-# broker's V3 slot vocabulary (gpu|cpu|gpu+cpu|remote) — and the legacy v2 names — to a single
-# local flock-lock name: the RTX 3090 is the one contended mutex, so a gpu+cpu bundle
-# serializes on "gpu" and "remote" needs no lock. Cross-department arbitration is the broker's
-# job in mcp.py; this flock is only a local fallback for direct CLI use (RESOURCE_BROKER §11).
+# If the preset declares a slot (gpu|cpu|gpu+cpu|remote) and the caller didn't pass
+# --resource, use it as the local flock-lock name: the RTX 3090 is the one contended mutex, so
+# a gpu+cpu bundle serializes on "gpu" and "remote" needs no lock. Cross-agent arbitration is
+# the orchestrator's job; this flock is only a local fallback for direct CLI use.
 if [ -z "$RESOURCE" ] && [ -n "$RESOURCE_TYPE" ]; then
   case "$RESOURCE_TYPE" in
-    remote)                                  RESOURCE="" ;;
-    gpu+cpu|gpu-overflow|gpu-exclusive|gpu-em) RESOURCE="gpu" ;;
-    cpu|cpu-bg)                              RESOURCE="cpu" ;;
-    *)                                       RESOURCE="$RESOURCE_TYPE" ;;
+    remote)  RESOURCE="" ;;
+    gpu+cpu) RESOURCE="gpu" ;;
+    *)       RESOURCE="$RESOURCE_TYPE" ;;   # gpu, cpu
   esac
 fi
 
