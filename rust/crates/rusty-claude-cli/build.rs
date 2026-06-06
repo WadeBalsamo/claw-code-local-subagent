@@ -54,4 +54,12 @@ fn main() {
     // Rerun if git state changes
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
+
+    // Rerun if any embedded launcher script changes (these are pulled in at
+    // compile time via `include_str!` in `src/install.rs`). Paths are relative
+    // to the crate root (`rust/crates/rusty-claude-cli/`).
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/lmcode.sh");
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/ollamacode.sh");
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/openroutercode.sh");
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/run-claw-code.sh");
 }

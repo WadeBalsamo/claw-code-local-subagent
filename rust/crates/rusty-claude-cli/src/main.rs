@@ -8,6 +8,7 @@
 )]
 mod init;
 mod input;
+mod install;
 mod render;
 mod setup;
 
@@ -498,6 +499,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        CliAction::Install {
+            install_dir,
+            repo_root,
+            force,
+            output_format,
+        } => install::run_install(install_dir, repo_root, force, output_format)?,
     }
     Ok(())
 }
@@ -602,6 +609,12 @@ enum CliAction {
     Setup {
         target: setup::SetupTarget,
         model: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Install {
+        install_dir: Option<PathBuf>,
+        repo_root: Option<PathBuf>,
+        force: bool,
         output_format: CliOutputFormat,
     },
     HelpTopic(LocalHelpTopic),
@@ -1032,6 +1045,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "setup" => parse_setup_args(&rest[1..], output_format),
+        "install" => parse_install_args(&rest[1..], output_format),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -1318,6 +1332,49 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
     }
 }
 
+/// Parse `claw install` flags: `--dir <path>` (install directory),
+/// `--repo-root <path>` (override repo-root detection), `--force`. Unknown
+/// arguments are rejected with a clear error, mirroring `parse_acp_args`.
+fn parse_install_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut install_dir: Option<PathBuf> = None;
+    let mut repo_root: Option<PathBuf> = None;
+    let mut force = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("`claw install --dir` requires a path argument"))?;
+                install_dir = Some(PathBuf::from(value));
+            }
+            "--repo-root" => {
+                let value = iter.next().ok_or_else(|| {
+                    String::from("`claw install --repo-root` requires a path argument")
+                })?;
+                repo_root = Some(PathBuf::from(value));
+            }
+            "--force" => force = true,
+            other => {
+                return Err(format!(
+                    "unsupported `claw install` argument: {other}. Use `--dir <path>`, `--repo-root <path>`, or `--force`."
+                ));
+            }
+        }
+    }
+
+    Ok(CliAction::Install {
+        install_dir,
+        repo_root,
+        force,
+        output_format,
+    })
+}
+
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
     let looks_like_skill_name = !bare_first_token.is_empty()
@@ -1492,6 +1549,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "system-prompt",
         "acp",
         "init",
+        "install",
         "export",
         "prompt",
     ];
@@ -9411,6 +9469,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw init")?;
     writeln!(
         out,
+        "  claw install [--dir PATH] [--repo-root PATH] [--force]"
+    )?;
+    writeln!(
+        out,
+        "      Install launcher shortcuts (claw, lmcode, ollamacode, openroutercode, run-claw-code) to ~/.local/bin"
+    )?;
+    writeln!(
+        out,
         "  claw export [PATH] [--session SESSION] [--output PATH]"
     )?;
     writeln!(
@@ -9498,6 +9564,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw install")?;
     writeln!(out, "  claw export")?;
     writeln!(out, "  claw export conversation.md")?;
     Ok(())
@@ -10660,6 +10727,42 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn parses_install_command_flags() {
+        assert_eq!(
+            parse_args(&["install".to_string()]).expect("bare install should parse"),
+            CliAction::Install {
+                install_dir: None,
+                repo_root: None,
+                force: false,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "install".to_string(),
+                "--dir".to_string(),
+                "/x".to_string(),
+                "--repo-root".to_string(),
+                "/y".to_string(),
+                "--force".to_string(),
+            ])
+            .expect("install with flags should parse"),
+            CliAction::Install {
+                install_dir: Some(PathBuf::from("/x")),
+                repo_root: Some(PathBuf::from("/y")),
+                force: true,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        let unknown = parse_args(&["install".to_string(), "--bogus".to_string()])
+            .expect_err("unknown install arg should error");
+        assert!(unknown.contains("--bogus"), "{unknown}");
+        let missing_value = parse_args(&["install".to_string(), "--dir".to_string()])
+            .expect_err("--dir without value should error");
+        assert!(missing_value.contains("--dir"), "{missing_value}");
     }
 
     #[test]
@@ -12071,6 +12174,7 @@ mod tests {
         assert!(help.contains("claw status"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
+        assert!(help.contains("claw install"));
         assert!(help.contains("claw acp [serve]"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
