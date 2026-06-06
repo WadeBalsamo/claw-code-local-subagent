@@ -1,0 +1,19 @@
+{
+  "preset_name": "qwen3-coder-30b",
+  "description": "Fast, reliable local coder (Qwen3-Coder-30B-A3B, Q5) that fits the RTX 3090 alone. The default for well-scoped slices: one file, a clear interface, a stated failing test. 256k context.",
+  "provider": "lmstudio",
+  "model": "qwen3-coder-30b-a3b-q5",
+  "lmstudio_model_id": "qwen3-coder-30b-a3b-q5",
+  "resource": "gpu",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a fast, reliable local coding model for well-scoped slices: one file, a clear interface, a stated failing test. You are stateless and one-shot. Implement exactly what the brief asks, touch only the files it lists, and make the cited test pass without modifying it. Read the codebase yourself (grep, open the cited files) instead of asking for context. Do not refactor outside the brief. If the slice can't be done within the stated boundaries, say so in your summary rather than guessing.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 262144,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 1800
+}

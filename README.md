@@ -21,12 +21,141 @@ Everything else — improved compaction, stream debugging, the named-resource sc
 
 ---
 
+## Set it up as a Claude Code sub-agent (start here)
+
+claw-code plugs into **Claude Code** as a sub-agent over MCP: Claude Code stays the
+orchestrator and calls one tool — `run_subagent` — to hand bulk coding to a **local model**
+(LM Studio / Ollama) or a cheap **OpenRouter** model, and gets back a bounded result (status
++ summary + diff stat), never the sub-agent's transcript. `claw mcp serve` is the stdio MCP
+server that exposes `run_subagent` and `list_presets`.
+
+### 1. Build & install
+
+```bash
+git clone https://github.com/wadebalsamo/claw-code-local-subagent.git
+cd claw-code-local-subagent
+./install.sh                 # builds `claw`, installs launchers into ~/.local/bin
+claw --version               # confirm (ensure ~/.local/bin is on your PATH)
+```
+
+### 2. Register the server in your `.claude/` config
+
+Pick one. The tool Claude Code will expose is `mcp__claw-subagents__run_subagent`.
+
+**Project-scoped (committed, shared with the repo)** — create **`.mcp.json`** at the repo root:
+
+```json
+{
+  "mcpServers": {
+    "claw-subagents": {
+      "type": "stdio",
+      "command": "claw",
+      "args": ["mcp", "serve"],
+      "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
+    }
+  }
+}
+```
+
+(Drop the `env` block if you only use a local backend.) Or let the CLI write it — `--scope
+project` writes `.mcp.json`; `--scope user` writes your global `~/.claude.json`:
+
+```bash
+claude mcp add --scope project claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve
+```
+
+### 3. Auto-approve the tools (skip the per-call prompt)
+
+Add to **`.claude/settings.json`** (project) or `~/.claude/settings.json` (user):
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__claw-subagents__run_subagent",
+      "mcp__claw-subagents__list_presets"
+    ]
+  }
+}
+```
+
+A project `.mcp.json` server is also approved once on first launch. Run `/mcp` inside Claude
+Code to confirm `claw-subagents` is connected and exposes `run_subagent` + `list_presets`.
+
+### 4. Point the sub-agent at a model & delegate
+
+- **OpenRouter (default):** set `OPENROUTER_API_KEY` (step 2). The default sub-agent model is
+  `deepseek/deepseek-v4-pro`; override per call with `model`, or globally with
+  `CLAW_SUBAGENT_MODEL`.
+- **Local:** run LM Studio (`localhost:1234`) with a **tool-capable** model — the recommended
+  local default is **NVIDIA Nemotron-3-Super 120B** (`nemotron-3-super-120b-a12b`) — and pass
+  `provider: "lmstudio"` + the loaded `model` (or just use the `nemotron-3-super-120b` preset).
+  Ollama works too (`localhost:11434`, `provider: "ollama"`).
+
+Ask Claude Code to delegate, or it calls `mcp__claw-subagents__run_subagent` directly — only
+`prompt` is required:
+
+```json
+{ "prompt": "Add input validation to src/api/users.rs and a unit test", "repo_dir": "/abs/path/to/repo" }
+```
+
+The **Setup reference** below expands this: choosing/verifying a backend, the in-process vs
+`isolated` execution modes, and GPU resource tips.
+
+---
+
+## Set it up as a coder worker for an autonomous agent fleet
+
+The fork's original purpose: let an **autonomous multi-agent system** — a department of
+orchestrator agents that themselves run on local/OpenRouter models (never Claude) — spawn
+stateless coder workers and review only the artifacts. The preset catalog is tuned for
+exactly this.
+
+**Pick a model; the prompt comes with it.** Each preset is keyed to one model and carries the
+system prompt that gets the most out of it — no personas, no role-play. The orchestrator picks
+the model per task (the smallest that will do), runs it **local-first** (zero marginal cost),
+and falls back to a **budget-gated** remote model when local can't serve the call:
+
+```bash
+run-claw-code --agent qwen3-coder-30b --dir <repo> --plan "<brief>" \
+  --pr-into sprint/<id> --sprint-id <id> \
+  [--provider openrouter --model deepseek/deepseek-v4-flash]   # budget-gated remote override
+```
+
+`--provider` / `--model` override a preset's local-first default, so the orchestrator can run
+the same task on a budget-gated remote model **without editing the preset**. The launcher
+never falls back to a remote model on its own — that path stays in the orchestrator, where the
+budget gate lives (no bypass).
+
+**The preset catalog** (`scripts/presets/`) — one preset per model:
+
+| Preset | Model | Where it runs | Best for |
+|---|---|---|---|
+| `qwen3-coder-30b` | Qwen3-Coder-30B (Q5) | local · `gpu` | Default coder for well-scoped, single-file slices |
+| `qwen3-coder-next` | Qwen3-Next-Coder 80B | local · `gpu+cpu` | Strongest local coder — complex, multi-file slices |
+| `nemotron-3-super-120b` | Nemotron-3-Super 120B | local · `gpu+cpu` | Hardest slices + one-shot planning (1M context) |
+| `nemotron-3-nano-30b` | Nemotron-3-Nano 30B | local · `cpu` | Fast, parallel-safe worker: tests, docs, analysis |
+| `nemotron-3-nano-4b` | Nemotron-3-Nano 4B | local · `cpu` | Tiny/quick: classify, route, summarize, extract |
+| `minimax-m2` | MiniMax-M2 | local · `cpu` | Ops & analysis: synthesis, comparison, decision support |
+| `deepseek-v4-flash` | DeepSeek-V4-Flash | OpenRouter · `remote` | Cheap remote tier for routine coding / review |
+| `deepseek-v4-pro` | DeepSeek-V4-Pro | OpenRouter · `remote` | Strong remote tier for hard diffs, reviews, audits |
+
+The local coders form a natural escalation ladder (30B → 80B → 120B); the two DeepSeek models
+are the remote tiers. CPU presets are parallel-safe; GPU presets serialize on the single GPU
+(the orchestrator arbitrates; `--resource` is a local `flock` fallback). The `list_presets`
+MCP tool returns each preset's `name`, `description`, `provider`, `model`, and `resource` so
+the orchestrator can choose one. The full CLI contract, PR automation (`--pr-into`), and
+sprint manifests (`--sprint-id`) are in **Providing claw-code as a tool to OpenClaw agents**
+below.
+
+---
+
 ## Primary Workflow: Sub-Agent Through `run-claw-code`
 
 The centerpiece of this fork is the `run-claw-code` entry point. It is designed for one-shot, isolated coding sessions launched by another agent.
 
 ```bash
-run-claw-code --agent dev-backend --dir /path/to/repo --plan "Fix the failing parser tests and update the retry logic" --resource 3090-vram
+run-claw-code --agent qwen3-coder-30b --dir /path/to/repo --plan "Fix the failing parser tests and update the retry logic" --resource gpu
 ```
 
 What happens when you run this:
@@ -64,17 +193,17 @@ task_id=<uuid>
 
 ### Preset Agents
 
-The `--agent` flag selects a JSON preset that configures the model, environment variables, and any provider-specific flags. Presets live in `scripts/presets/`:
+The `--agent` flag selects a JSON preset in `scripts/presets/` that carries the local-first
+`provider`/`model`, the broker `resource` slot, the model-tuned `system_prompt`,
+`permission_mode` / `plan_mode`, and operational fields (`completion_webhook`, `budget_gate`,
+`open_pr`). The shipped catalog is **one preset per model** — `qwen3-coder-30b`,
+`qwen3-coder-next`, `nemotron-3-super-120b`, `nemotron-3-nano-30b`, `nemotron-3-nano-4b`,
+`minimax-m2`, `deepseek-v4-flash`, `deepseek-v4-pro` — detailed under
+[Set it up as a coder worker for an autonomous agent fleet](#set-it-up-as-a-coder-worker-for-an-autonomous-agent-fleet).
 
-| Preset | Purpose |
-|---|---|
-| `dev-backend` | Backend development (Rust, API work) — via Ollama (nemotron-3-nano-4b) |
-| `dev-frontend` | Frontend development (TypeScript, React) — auto-detect provider (qwen3:14b) |
-| `planner` | Software architect using deepseek-v4-flash on OpenRouter — large context, structured planning |
-| `bugfix` | Bug fixer using local LM Studio (qwen3:14b) — focused, precise, minimal changes |
-| `documentation` | Technical writer using Ollama (nemotron-3-nano-4b) — read-only, fast, good for prose |
-
-Custom presets can be added to `~/.lmcode/presets/` or passed inline through environment overrides.
+Add your own under `~/.lmcode/presets/` (takes precedence) or `scripts/presets/`; run
+`run-claw-code --help` for the full preset JSON schema. The `list_presets` MCP tool
+enumerates whatever is installed.
 
 ---
 
@@ -158,7 +287,10 @@ See the next section for a complete, step-by-step walkthrough of wiring claw-cod
 
 ---
 
-## Setup Guide: claw-code as a Sub-Agent for Claude Code & OpenClaw
+## Setup reference: backends, verification & execution modes
+
+This expands the two quickstarts above with the full detail — backends, verification, and the
+two execution modes.
 
 ### The mental model
 
@@ -190,7 +322,7 @@ Point the sub-agent at OpenRouter (simplest) or a local server. You can configur
 2. Store it (either works):
    - `claw setup openrouter` — interactive; saves the key to `~/.config/openroutercode/.env`, **or**
    - export it for the session: `export OPENROUTER_API_KEY=sk-or-...`
-3. The default sub-agent model is `deepseek/deepseek-v4-pro` — cheap and tool-capable. Use `deepseek/deepseek-v4-flash` for a lighter/faster option, or any tool-capable OpenRouter model. Override globally with `CLAW_SUBAGENT_MODEL`, or per call with the `model` field.
+3. The default sub-agent model is `deepseek/deepseek-v4-pro` — the strong, tool-capable default. Use `deepseek/deepseek-v4-flash` for a cheaper/faster option, or any tool-capable OpenRouter model. Override globally with `CLAW_SUBAGENT_MODEL`, or per call with the `model` field.
 
 #### Option B — Local: Ollama
 
@@ -301,10 +433,10 @@ Local inference is VRAM-bound, and that shapes how you run local sub-agents:
 - **A single Claude Code session is already serialized.** The MCP server processes `run_subagent` calls **one at a time**, so one Claude Code session won't fan out concurrent GPU hits through a given `claw mcp serve`.
 - **For fleets / multiple orchestrators, use the named-resource scheduler.** Concurrency across *different* agents is where GPUs collide. Tag work to a named resource and the scheduler serializes it with `flock`:
   ```bash
-  run-claw-code --agent dev-backend --dir /repo --plan "..." \
-    --resource 3090-vram --max-parallel 1
+  run-claw-code --agent qwen3-coder-30b --dir /repo --plan "..." \
+    --resource gpu --max-parallel 1
   ```
-  All tasks tagged `3090-vram` are serialized (cap = how many models fit in VRAM, usually `1`), while a task on a different resource (e.g. `cpu-rag`) runs concurrently. From Claude Code you reach this path via `run_subagent` with `isolated: true` and a preset whose `resource_type` is a GPU lane (`gpu-exclusive`, `gpu-em`, `gpu-overflow`), or by calling `run-claw-code` directly. See [Named-Resource Scheduling](#named-resource-scheduling).
+  All tasks tagged `gpu` are serialized (cap = how many models fit in VRAM, usually `1`), while a task on a different resource (e.g. `cpu`) runs concurrently. From Claude Code you reach this path via `run_subagent` with `isolated: true` and a preset whose `resource` is a GPU slot (`gpu` or `gpu+cpu`), or by calling `run-claw-code` directly. See [Named-Resource Scheduling](#named-resource-scheduling).
 - **Keep models warm:** `OLLAMA_KEEP_ALIVE=30m` avoids paying model-load latency on every delegated task.
 - **Leave resilience on for local:** `CLAW_RESILIENCE` auto-enables for localhost endpoints (force it with `CLAW_RESILIENCE=force`). It converts GPU warm-up stalls and model-unload blips into automatic retries instead of hard failures — see [Resilience and Self-Healing](#resilience-and-self-healing).
 
@@ -330,7 +462,7 @@ task_id=<uuid>
 /tmp/claw-runs/<uuid>/summary.md
 # plus pr_request.json when --pr-into is set
 ```
-This path layers on what fleet orchestration needs beyond `run_subagent`: git-worktree isolation, hard kill-on-timeout, the `flock` GPU scheduler, and optional PR creation (`--pr-into`) and sprint manifests (`--sprint-id`). The orchestrator polls `status.json`, reads `summary.md`, applies `diff.patch` — never ingesting the transcript. Presets (`scripts/presets/`, or per-user `~/.lmcode/presets/`) carry the provider/model/permission/`resource_type`, so the OpenClaw side only picks a preset and a task.
+This path layers on what fleet orchestration needs beyond `run_subagent`: git-worktree isolation, hard kill-on-timeout, the `flock` GPU scheduler, and optional PR creation (`--pr-into`) and sprint manifests (`--sprint-id`). The orchestrator polls `status.json`, reads `summary.md`, applies `diff.patch` — never ingesting the transcript. Presets (`scripts/presets/`, or per-user `~/.lmcode/presets/`) carry the local-first `provider`/`model`, the `tier_ref`, the broker `resource` slot, and the permission/plan modes, so the orchestrator only picks a preset and a task — and may override `--provider`/`--model` to run a budget-gated OpenRouter rung.
 
 **Which to use:** MCP `run_subagent` for interactive, one-off delegation (Claude Code, or an MCP-native OpenClaw agent); `run-claw-code` for batch/parallel fleets that need GPU scheduling and PR automation.
 
@@ -387,7 +519,7 @@ This builds the `claw` binary and installs launcher shortcuts to `~/.local/bin/`
 ollamacode --model qwen3:14b
 
 # One-shot sub-agent task from an orchestrator
-run-claw-code --agent dev-backend --dir /workspace/repo \
+run-claw-code --agent qwen3-coder-30b --dir /workspace/repo \
   --plan "Add input validation to the user registration endpoint"
 
 # Direct invocation
@@ -401,10 +533,10 @@ claw --model qwen3:14b "Refactor this module to use async/await"
 ```bash
 # Step 1: Launch an isolated coding session
 run-claw-code \
-  --agent dev-backend \
+  --agent qwen3-coder-30b \
   --dir /home/user/project \
   --plan "Add a /health endpoint that returns 200 and the build timestamp" \
-  --resource 3090-vram \
+  --resource gpu \
   --timeout 1200
 
 # Output:
@@ -464,7 +596,7 @@ This fork is under active development. The features listed below are verified im
 - **HTTP proxy support** — Complete. `http_client.rs` with `ProxyConfig::from_env()`.
 - **Per-base-url request building** — Complete. Different serialization for LM Studio vs OpenAI endpoints.
 - **Tool message sanitization** — Complete. Strips orphaned tool messages before sending.
-- **Six preset agents** — Complete. `planner`, `bugfix`, `documentation`, `dev-backend`, `dev-frontend`, and custom user presets for `run-claw-code`.
+- **Model-keyed preset catalog** — Complete. One preset per model — `qwen3-coder-30b`, `qwen3-coder-next`, `nemotron-3-super-120b`, `nemotron-3-nano-30b`, `nemotron-3-nano-4b`, `minimax-m2`, `deepseek-v4-flash`, `deepseek-v4-pro` — plus custom user presets for `run-claw-code`.
 
 ### In Active Integration
 

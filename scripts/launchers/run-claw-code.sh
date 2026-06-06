@@ -11,24 +11,43 @@
 #   diff_file=/tmp/claw-runs/<uuid>/diff.patch
 #   summary_file=/tmp/claw-runs/<uuid>/summary.md
 #
-# Preset JSON schema (each field is optional):
+# Preset JSON schema (every field is optional):
 #   {
-#     "provider": "openrouter|lmstudio|ollama|anthropic|openai|auto",
-#     "model": "deepseek/deepseek-v4-flash",
+#     "preset_name": "qwen3-coder-30b",
+#     "tier_ref": "presets.<name>",         # optional: orchestrator key into its config/model_tiers.json
+#     "provider": "lmstudio|openrouter|ollama|anthropic|openai|auto",
+#     "model": "qwen3-coder-30b-a3b-q5",    # local-first default; the orchestrator can override
+#                                           # it (budget-gated) via --provider/--model
+#     "lmstudio_model_id": "qwen3-coder-30b-a3b-q5",
+#     "resource": "gpu|cpu|gpu+cpu|remote", # broker slot (RESOURCE_BROKER V3 vocabulary)
 #     "env": { "OPENAI_BASE_URL": "...", "OPENAI_API_KEY": "...", ... },
 #     "system_prompt": "...",
-#     "plan_mode": "normal|ultraplan",
-#     "temperature": 0.1,
-#     "max_context": 128000,
+#     "plan_mode": "normal|ultraplan|plan-only",
+#     "temperature": 0.2,
+#     "max_context": 262144,
 #     "permission_mode": "danger-full-access|read-only|default",
-#     "allowed_tools": ["read_file", "write_file", ...]
+#     "allowed_tools": ["read_file", "edit_file", ...],
+#     "budget_gate": true,
+#     "open_pr": false,
+#     "requires_feature_flag": "CONSULTANT_ENABLED",  # gated presets only
+#     "max_cost_usd": 0.50,                            # remote presets only
+#     "cfo_budget_endpoint": "http://localhost:9000/mcp/budget/consultant",
+#     "completion_webhook": "http://localhost:8765/claw-run-complete",
+#     "timeout_seconds": 1800
 #   }
+#
+# Local-first / OpenRouter-fallback: a preset names ONE concrete provider/model — its
+# local-first default. The hybrid ladder (local rung, then budget-gated OpenRouter rungs)
+# lives in config/model_tiers.json under `tier_ref`; the orchestrator (mcp.py) resolves the
+# rung, budget-gates the OpenRouter path, and re-dispatches with `--provider/--model` to
+# override the preset default. This launcher never falls back to OpenRouter on its own — that
+# would bypass the budget gate. See meta/MODEL_ROUTING.md + meta/clawcode-specs.md.
 #
 # Presets are resolved from (in order):
 #   1. ~/.lmcode/presets/<agent>.json
 #   2. <REPO_ROOT>/scripts/presets/<agent>.json
 #
-# If no preset is found, the agent runs with defaults (model from env).
+# If no preset is found, the agent runs with defaults (model from env / --model).
 
 set -euo pipefail
 
@@ -59,6 +78,8 @@ MAX_PARALLEL=1
 PR_INTO=""
 SPRINT_ID=""
 BRANCH_OVERRIDE=""
+PROVIDER_OVERRIDE=""
+MODEL_OVERRIDE=""
 
 list_visible_presets() {
   # Enumerate presets in both search paths, hiding any whose
@@ -83,7 +104,7 @@ for d in paths:
                 continue
         seen.add(name)
         desc = p.get("description", "")
-        rt = p.get("resource_type") or p.get("resource") or ""
+        rt = p.get("resource") or ""
         print(f"  {name:<32} [{rt:<14}] {desc[:80]}")
 PY
 }
@@ -91,9 +112,13 @@ PY
 show_help() {
   cat <<EOF
 Usage: run-claw-code --agent <preset> --dir <path> --plan <prompt>
-       [--id <uuid>] [--remote] [--resource <name>] [--timeout <sec>]
-       [--max-parallel <N>] [--pr-into <base_branch>] [--sprint-id <id>]
-       [--branch <name>] [--help]
+       [--provider <p>] [--model <m>] [--id <uuid>] [--remote]
+       [--resource <name>] [--timeout <sec>] [--max-parallel <N>]
+       [--pr-into <base_branch>] [--sprint-id <id>] [--branch <name>] [--help]
+
+  --provider / --model override the preset's local-first default. The orchestrator uses them
+  to run a preset's task on a budget-gated remote rung (e.g. the qwen3-coder-30b preset's task
+  on deepseek-v4-flash) without editing the preset.
 
 Output (4 lines):
   task_id=<uuid>
@@ -110,21 +135,26 @@ EOF
   cat <<EOF
 
 Preset JSON schema fields:
-  provider              - openrouter|lmstudio|ollama|anthropic|openai|auto
-  model                 - model string passed via --model
-  lmstudio_model_id     - exact ID for scheduler LMStudio swap
-  resource_type         - gpu-exclusive|gpu-em|gpu-overflow|cpu-bg|remote
+  preset_name           - canonical name (defaults to the filename)
+  tier_ref              - orchestrator key into config/model_tiers.json (hybrid ladder)
+  provider              - lmstudio|openrouter|ollama|anthropic|openai|auto (local-first default)
+  model                 - local-first model id (overridable with --model)
+  lmstudio_model_id     - exact ID for the broker's LMStudio swap
+  resource              - gpu|cpu|gpu+cpu|remote (the broker slot the local model holds)
   env                   - object of env var name:value pairs to set
-  plan_mode             - normal or ultraplan
+  plan_mode             - normal|ultraplan|plan-only
   system_prompt         - prepended to the plan text
   temperature           - model temperature (0.0-1.0)
   max_context           - context window limit
   permission_mode       - danger-full-access|read-only|default
-  allowed_tools         - list of tool names to restrict to
+  allowed_tools         - advisory list of tool names (metadata; not enforced by this launcher)
+  budget_gate           - true: every OpenRouter dispatch is budget-gated upstream (no bypass)
+  open_pr               - true: worker may open a PR (security boundary; default false)
   requires_feature_flag - env var that must be truthy to expose this preset
   max_cost_usd          - per-invocation cost cap (remote presets)
   cfo_budget_endpoint   - URL for live budget MCP check
   completion_webhook    - URL to POST on task exit (wake-on-completion)
+  timeout_seconds       - default wall-clock timeout (overridable with --timeout)
 EOF
   exit 0
 }
@@ -135,6 +165,8 @@ while [ $# -gt 0 ]; do
     --dir) WORK_DIR="$2"; shift 2 ;;
     --plan) PLAN="$2"; shift 2 ;;
     --id) TASK_ID="$2"; shift 2 ;;
+    --provider) PROVIDER_OVERRIDE="$2"; shift 2 ;;
+    --model) MODEL_OVERRIDE="$2"; shift 2 ;;
     --remote) REMOTE=1; shift ;;
     --resource) RESOURCE="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
@@ -189,6 +221,12 @@ else:
     print('')
 " 2>/dev/null || echo "")
 
+# Caller-supplied provider/model win over the preset's local-first defaults. This is how the
+# orchestrator (mcp.py) re-dispatches a budget-gated OpenRouter rung onto a preset whose
+# default is the local model — keeping the budget gate upstream, never in this launcher.
+if [ -n "$PROVIDER_OVERRIDE" ]; then PROVIDER="$PROVIDER_OVERRIDE"; fi
+if [ -n "$MODEL_OVERRIDE" ]; then MODEL="$MODEL_OVERRIDE"; fi
+
 # Apply env vars from preset (user can override)
 python3 -c "
 import json, os
@@ -201,16 +239,23 @@ print('env applied')
 # ---------------------------------------------------------------------------
 # Extended preset fields (workflow wiring)
 # ---------------------------------------------------------------------------
-RESOURCE_TYPE=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('resource_type','') or '')" 2>/dev/null || echo "")
+RESOURCE_TYPE=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('resource') or '')" 2>/dev/null || echo "")
 LMSTUDIO_MODEL_ID=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('lmstudio_model_id','') or '')" 2>/dev/null || echo "")
 REQUIRES_FLAG=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('requires_feature_flag','') or '')" 2>/dev/null || echo "")
 MAX_COST_USD=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('max_cost_usd','') or '')" 2>/dev/null || echo "")
 CFO_BUDGET_ENDPOINT=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('cfo_budget_endpoint','') or '')" 2>/dev/null || echo "")
 COMPLETION_WEBHOOK=$(python3 -c "import json; d=json.loads('$PRESET_JSON'); print(d.get('completion_webhook','') or '')" 2>/dev/null || echo "")
 
-# If preset declares a resource_type and caller didn't pass --resource, use it.
+# If the preset declares a slot (gpu|cpu|gpu+cpu|remote) and the caller didn't pass
+# --resource, use it as the local flock-lock name: the RTX 3090 is the one contended mutex, so
+# a gpu+cpu bundle serializes on "gpu" and "remote" needs no lock. Cross-agent arbitration is
+# the orchestrator's job; this flock is only a local fallback for direct CLI use.
 if [ -z "$RESOURCE" ] && [ -n "$RESOURCE_TYPE" ]; then
-  RESOURCE="$RESOURCE_TYPE"
+  case "$RESOURCE_TYPE" in
+    remote)  RESOURCE="" ;;
+    gpu+cpu) RESOURCE="gpu" ;;
+    *)       RESOURCE="$RESOURCE_TYPE" ;;   # gpu, cpu
+  esac
 fi
 
 # Feature-flag gate: refuse to dispatch if required env var is not truthy.

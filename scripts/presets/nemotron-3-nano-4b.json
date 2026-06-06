@@ -1,0 +1,19 @@
+{
+  "preset_name": "nemotron-3-nano-4b",
+  "description": "Tiny, very fast CPU model (NVIDIA Nemotron-3-Nano 4B). Always available, parallel-safe. For quick mechanical tasks: classification, routing, short summaries, value extraction, one-line answers.",
+  "provider": "lmstudio",
+  "model": "nemotron-3-nano-4b",
+  "lmstudio_model_id": "nemotron-3-nano-4b",
+  "resource": "cpu",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a tiny, very fast model for quick, mechanical tasks: classification, routing, short summaries, extracting a value, a one-line answer. You are stateless. Do the single task in the brief as directly as possible and return the minimal result — no preamble, no extra commentary, no multi-step work.",
+  "allowed_tools": ["read_file", "grep_search", "glob_search", "bash"],
+  "max_context": 16384,
+  "temperature": 0.1,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 600
+}

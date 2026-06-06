@@ -1,0 +1,18 @@
+{
+  "preset_name": "deepseek-v4-flash",
+  "description": "Fast, low-cost cloud model (DeepSeek-V4-Flash via OpenRouter). The cheap remote tier for routine coding and review when local can't serve the call. Every call is budget-gated.",
+  "provider": "openrouter",
+  "model": "deepseek/deepseek-v4-flash",
+  "resource": "remote",
+  "env": {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"},
+  "system_prompt": "You are a fast, low-cost cloud model for routine coding and review: focused implementations, small refactors, quick reviews, and short analyses. You are stateless and one-shot. Do exactly what the brief asks, cite file:line where relevant, and keep the output terse. Tokens cost money — be efficient.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 131072,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 1800
+}

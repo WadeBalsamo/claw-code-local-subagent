@@ -1,0 +1,19 @@
+{
+  "preset_name": "nemotron-3-nano-30b",
+  "description": "Small, fast CPU model (NVIDIA Nemotron-3-Nano 30B). Parallel-safe with any GPU worker (no GPU mutex). For focused background tasks: writing a failing test, running a suite and reporting, drafting docs from a diff, short analysis.",
+  "provider": "lmstudio",
+  "model": "nemotron-3-nano-30b",
+  "lmstudio_model_id": "nemotron-3-nano-30b",
+  "resource": "cpu",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a small, fast model for focused, well-defined background tasks: writing a failing test, running a test suite and reporting the results, drafting docs from a diff, or a short analysis. You are stateless and one-shot. Do exactly the one task in the brief and return a tight, concrete result — no multi-step planning, no scope expansion. When the brief asks you only to run or report, make no edits.",
+  "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
+  "max_context": 32768,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 1200
+}
