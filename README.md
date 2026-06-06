@@ -152,6 +152,52 @@ The install.sh script also deploys standalone shell launchers to `~/.local/bin/`
 | `ollamacode` | Ollama — server management, model TUI, context length detection |
 | `openroutercode` | OpenRouter — 300+ model browser with pagination and filter chaining |
 
+### Using claw as an MCP sub-agent server
+
+`claw mcp serve` runs a stdio MCP server that exposes a purpose-built
+`run_subagent` tool (plus `list_presets`) so a parent agent — Claude Code,
+openclaw, or any MCP client — can spawn a **local or OpenRouter sub-agent** and
+get a single bounded result back, instead of the entire raw toolbox.
+
+Register it with Claude Code:
+
+```bash
+claude mcp add claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve
+```
+
+Or add it to a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "claw-subagents": {
+      "command": "claw",
+      "args": ["mcp", "serve"],
+      "env": { "OPENROUTER_API_KEY": "sk-or-..." }
+    }
+  }
+}
+```
+
+The parent then sees two tools: `mcp__claw-subagents__run_subagent` and
+`mcp__claw-subagents__list_presets`. A `run_subagent` call accepts `prompt`
+(required), plus optional `provider`
+(`local|openrouter|ollama|lmstudio|anthropic|openai|auto`), `model`,
+`repo_dir`, `subagent_type`, `permission_mode`, `timeout_secs`,
+`max_output_chars`, and `isolated`. It returns structured JSON
+(`status`/`summary`/`diff_stat`/`duration_ms`/…), encoding failures and
+timeouts in `status`/`error` rather than as transport errors.
+
+Defaults: with no `model`, the sub-agent uses a DeepSeek model via OpenRouter
+(override per-call or with `CLAW_SUBAGENT_MODEL`). Notes:
+
+- `provider: "local" | "ollama" | "lmstudio"` requires the local server to be
+  running **and** an explicit `model` (there is no local default).
+- `provider: "anthropic"` requires `ANTHROPIC_API_KEY` and an explicit Claude
+  `model`.
+- `provider: "openrouter"` reads `OPENROUTER_API_KEY` (or
+  `~/.config/openroutercode/.env`, then `~/.config/opencode/.env`).
+
 ---
 
 ## Improved Compaction

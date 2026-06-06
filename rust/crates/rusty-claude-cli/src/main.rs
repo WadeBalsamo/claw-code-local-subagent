@@ -54,9 +54,7 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
-};
+use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
@@ -2211,11 +2209,6 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Starts a minimal Model Context Protocol server that exposes claw's
-/// built-in tools over stdio.
-///
-/// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
-/// dispatched through [`tools::execute_tool`], so this server exposes exactly
 /// Read `.claw/worker-state.json` from the current working directory and print it.
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
 /// atomically writes state transitions here so external observers (clawhip, orchestrators)
@@ -2254,25 +2247,38 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// the same surface the in-process agent loop uses.
-fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
-    let tools = mvp_tool_specs()
-        .into_iter()
-        .map(|spec| McpTool {
-            name: spec.name.to_string(),
-            description: Some(spec.description.to_string()),
-            input_schema: Some(spec.input_schema),
-            annotations: None,
-            meta: None,
-        })
-        .collect();
+/// Convert a tools-crate [`tools::ToolSpec`] into the runtime [`McpTool`]
+/// descriptor advertised over `tools/list`.
+fn tool_spec_to_mcp_tool(spec: tools::ToolSpec) -> McpTool {
+    McpTool {
+        name: spec.name.to_string(),
+        description: Some(spec.description.to_string()),
+        input_schema: Some(spec.input_schema),
+        annotations: None,
+        meta: None,
+    }
+}
 
-    let spec = McpServerSpec {
-        server_name: "claw".to_string(),
+/// Build the curated `claw mcp serve` spec: a purpose-built `run_subagent` +
+/// `list_presets` pair (instead of the entire raw toolbox), dispatched through
+/// [`tools::handle_subagent_mcp_call`].
+fn build_subagent_mcp_spec() -> McpServerSpec {
+    let tools = vec![
+        tool_spec_to_mcp_tool(tools::run_subagent_tool_spec()),
+        tool_spec_to_mcp_tool(tools::list_presets_tool_spec()),
+    ];
+    McpServerSpec {
+        server_name: "claw-subagents".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
-    };
+        tool_handler: Box::new(tools::handle_subagent_mcp_call),
+    }
+}
+
+/// Run `claw mcp serve`: an stdio MCP server exposing the curated sub-agent
+/// tools so a parent agent can spawn local/OpenRouter sub-agents.
+fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = build_subagent_mcp_spec();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5308,9 +5314,10 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
-        // tools. All other `mcp` subcommands fall through to the existing
-        // configured-server reporter (`list`, `status`, ...).
+        // `claw mcp serve` starts a stdio MCP server exposing the curated
+        // sub-agent tools (`run_subagent`, `list_presets`). All other `mcp`
+        // subcommands fall through to the existing configured-server reporter
+        // (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
             return run_mcp_serve();
         }
