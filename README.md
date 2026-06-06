@@ -137,7 +137,7 @@ The `claw setup` subcommand configures and launches provider-specific sessions:
 - Launches claw with the selected model
 
 **`claw setup openrouter [model]`**
-- Manages API key in `~/.config/opencode/.env`
+- Manages API key in `~/.config/openroutercode/.env` (falls back to the legacy `~/.config/opencode/.env` for existing users)
 - Fetches the tool-capable model catalog from OpenRouter
 - Sets `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, `CLAW_RESILIENCE=none`
 - Launches claw with the selected model
@@ -150,7 +150,7 @@ The install.sh script also deploys standalone shell launchers to `~/.local/bin/`
 |---|---|
 | `lmcode` | LM Studio — auto-discovery, model list, config save |
 | `ollamacode` | Ollama — server management, model TUI, context length detection |
-| `opencode` | OpenRouter — 300+ model browser with pagination and filter chaining |
+| `openroutercode` | OpenRouter — 300+ model browser with pagination and filter chaining |
 
 ---
 
@@ -286,7 +286,7 @@ This fork is under active development. The features listed below are verified im
 
 ### In Active Integration
 
-- **TUI/fzf model browser for `setup openrouter`** — The shell launcher (`opencode`) has this via external scripts. The native `claw setup openrouter` command currently accepts model names directly; a TUI model selector is a planned enhancement.
+- **TUI/fzf model browser for `setup openrouter`** — The shell launcher (`openroutercode`) has this via external scripts. The native `claw setup openrouter` command currently accepts model names directly; a TUI model selector is a planned enhancement.
 - **Provider-specific request serialization refinements** — Per-base-url functions are in place; broader coverage for additional local inference server variants is ongoing.
  
 ---

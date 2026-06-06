@@ -2161,7 +2161,7 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 /// Read `.claw/worker-state.json` from the current working directory and print it.
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
 /// atomically writes state transitions here so external observers (clawhip, orchestrators)
-/// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
+/// can poll current `WorkerStatus` without needing an HTTP route on the claw binary.
 fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");

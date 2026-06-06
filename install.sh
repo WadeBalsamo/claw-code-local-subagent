@@ -2,7 +2,7 @@
 # Claw Code installer
 #
 # Builds the `claw` binary from the `rust/` workspace and installs
-# the launcher shortcuts (lmcode, ollamacode, opencode, run-claw-code)
+# the launcher shortcuts (lmcode, ollamacode, openroutercode, run-claw-code)
 # to ~/.local/bin/.
 #
 # Usage:
@@ -343,7 +343,7 @@ mkdir -p "${INSTALL_DIR}"
 LAUNCHER_MAP=(
     "lmcode.sh:lmcode"
     "ollamacode.sh:ollamacode"
-    "opencode.sh:opencode"
+    "openroutercode.sh:openroutercode"
     "run-claw-code.sh:run-claw-code"
 )
 
@@ -423,7 +423,7 @@ ${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
 
   Binary:   ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
   Profile:  ${BUILD_PROFILE}
-  Shortcuts: ${INSTALL_DIR}/{claw,lmcode,ollamacode,opencode,run-claw-code}
+  Shortcuts: ${INSTALL_DIR}/{claw,lmcode,ollamacode,openroutercode,run-claw-code}
 
 Try it out:
 
@@ -437,7 +437,7 @@ Try it out:
   ollamacode --model qwen3:27b
 
   ${COLOR_DIM}# OpenRouter${COLOR_RESET}
-  opencode
+  openroutercode
 
   ${COLOR_DIM}# Sub-agent entry point${COLOR_RESET}
   run-claw-code --agent dev-frontend --dir /path/to/repo --plan "fix the bug"

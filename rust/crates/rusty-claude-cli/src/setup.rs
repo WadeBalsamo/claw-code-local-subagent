@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::{
@@ -693,7 +693,11 @@ fn setup_lmstudio(model_hint: Option<String>) -> Result<SetupResult, Box<dyn std
 
 // ── OpenRouter ────────────────────────────────────────────────────────
 
-const OPENROUTER_CONFIG_SUBDIR: &str = ".config/opencode";
+const OPENROUTER_CONFIG_SUBDIR: &str = ".config/openroutercode";
+// Legacy location used before the launcher/config-dir rename to
+// `openroutercode`. We still read from here so existing users' saved
+// API keys keep working without re-entering them.
+const OPENROUTER_LEGACY_CONFIG_SUBDIR: &str = ".config/opencode";
 const OPENROUTER_ENV_FILE: &str = ".env";
 
 fn openrouter_config_dir() -> PathBuf {
@@ -702,6 +706,29 @@ fn openrouter_config_dir() -> PathBuf {
 
 fn openrouter_env_path() -> PathBuf {
     openrouter_config_dir().join(OPENROUTER_ENV_FILE)
+}
+
+fn openrouter_legacy_config_dir() -> PathBuf {
+    default_home().join(OPENROUTER_LEGACY_CONFIG_SUBDIR)
+}
+
+fn openrouter_legacy_env_path() -> PathBuf {
+    openrouter_legacy_config_dir().join(OPENROUTER_ENV_FILE)
+}
+
+/// Parse an `OPENROUTER_API_KEY=...` value out of a `.env`-style file.
+/// Returns `None` if the file is missing, unreadable, or has no non-empty key.
+fn read_key_from_env_file(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("OPENROUTER_API_KEY=") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn save_openrouter_api_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -724,18 +751,13 @@ fn load_openrouter_api_key() -> Result<String, String> {
             return Ok(key);
         }
     }
-    let env_path = openrouter_env_path();
-    if env_path.exists() {
-        let content = fs::read_to_string(&env_path)
-            .map_err(|e| format!("failed to read {path}: {e}", path = env_path.display()))?;
-        for line in content.lines() {
-            if let Some(value) = line.strip_prefix("OPENROUTER_API_KEY=") {
-                let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    return Ok(trimmed.to_string());
-                }
-            }
-        }
+    // Prefer the current config dir, then fall back to the legacy
+    // `~/.config/opencode/.env` so keys saved before the rename still work.
+    if let Some(key) = read_key_from_env_file(&openrouter_env_path()) {
+        return Ok(key);
+    }
+    if let Some(key) = read_key_from_env_file(&openrouter_legacy_env_path()) {
+        return Ok(key);
     }
     Err(format!(
         "OpenRouter API key not found.\n\
@@ -1078,6 +1100,9 @@ mod tests {
 
     #[test]
     fn recent_api_models_roundtrip() {
+        // Shares `recent_api_models_path()` (HOME-derived) with other tests;
+        // hold the env lock so parallel runs don't clobber the file.
+        let _env = home_env_lock();
         let path = recent_api_models_path();
         let _ = fs::remove_file(&path);
 
@@ -1098,6 +1123,7 @@ mod tests {
 
     #[test]
     fn recent_api_models_limited() {
+        let _env = home_env_lock();
         let path = recent_api_models_path();
         let _ = fs::remove_file(&path);
         for i in 0..50 {
@@ -1145,5 +1171,151 @@ mod tests {
         assert_eq!(format_ctx(128_000), "128K");
         assert_eq!(format_ctx(1_000_000), "1M");
         assert_eq!(format_ctx(1_500_000), "1M");
+    }
+
+    // ── OpenRouter API key load/save (env-isolated) ───────────────────
+    //
+    // These tests mutate process-global env vars (`HOME`,
+    // `OPENROUTER_API_KEY`), so they share a mutex and restore the prior
+    // values on drop. Other tests in this binary run in the same process.
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    // Serializes every test in this module that depends on `HOME` (the
+    // OpenRouter key tests below plus the recent-models tests above, which
+    // share a single `recent_api_models_path()` file). Without this, those
+    // tests race on process-global state when run in parallel.
+    fn home_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Restores `HOME` and `OPENROUTER_API_KEY` to their prior values when
+    /// dropped, regardless of test outcome.
+    struct OpenRouterEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev_home: Option<String>,
+        prev_key: Option<String>,
+    }
+
+    impl OpenRouterEnvGuard {
+        /// Acquire the shared lock, point `HOME` at `home`, and clear
+        /// `OPENROUTER_API_KEY` so file-based loading is exercised.
+        fn new(home: &Path) -> Self {
+            let lock = home_env_lock();
+            let prev_home = env::var("HOME").ok();
+            let prev_key = env::var("OPENROUTER_API_KEY").ok();
+            env::set_var("HOME", home);
+            env::remove_var("OPENROUTER_API_KEY");
+            Self {
+                _lock: lock,
+                prev_home,
+                prev_key,
+            }
+        }
+    }
+
+    impl Drop for OpenRouterEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match &self.prev_key {
+                Some(v) => env::set_var("OPENROUTER_API_KEY", v),
+                None => env::remove_var("OPENROUTER_API_KEY"),
+            }
+        }
+    }
+
+    fn openrouter_temp_home() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("claw-openrouter-{nanos}-{unique}"));
+        fs::create_dir_all(&dir).expect("temp home should be creatable");
+        dir
+    }
+
+    fn write_env_file(dir: &Path, key: &str) {
+        fs::create_dir_all(dir).expect("config dir should be creatable");
+        fs::write(
+            dir.join(OPENROUTER_ENV_FILE),
+            format!("OPENROUTER_API_KEY={key}\n"),
+        )
+        .expect("env file should write");
+    }
+
+    #[test]
+    fn load_openrouter_api_key_prefers_new_dir() {
+        let home = openrouter_temp_home();
+        let _guard = OpenRouterEnvGuard::new(&home);
+        write_env_file(&home.join(OPENROUTER_CONFIG_SUBDIR), "new-dir-key");
+
+        let loaded = load_openrouter_api_key().expect("key should load from new dir");
+        assert_eq!(loaded, "new-dir-key");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_openrouter_api_key_falls_back_to_legacy_opencode_dir() {
+        let home = openrouter_temp_home();
+        let _guard = OpenRouterEnvGuard::new(&home);
+        // Only the legacy ~/.config/opencode/.env exists.
+        write_env_file(&home.join(OPENROUTER_LEGACY_CONFIG_SUBDIR), "legacy-key");
+
+        let loaded = load_openrouter_api_key().expect("key should load from legacy opencode dir");
+        assert_eq!(loaded, "legacy-key");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_openrouter_api_key_new_dir_wins_over_legacy() {
+        let home = openrouter_temp_home();
+        let _guard = OpenRouterEnvGuard::new(&home);
+        write_env_file(&home.join(OPENROUTER_CONFIG_SUBDIR), "new-dir-key");
+        write_env_file(&home.join(OPENROUTER_LEGACY_CONFIG_SUBDIR), "legacy-key");
+
+        let loaded = load_openrouter_api_key().expect("key should load");
+        assert_eq!(loaded, "new-dir-key", "new dir must take precedence");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_into_new_dir() {
+        let home = openrouter_temp_home();
+        let _guard = OpenRouterEnvGuard::new(&home);
+
+        save_openrouter_api_key("saved-key").expect("save should succeed");
+
+        // The key file must live under the new config dir.
+        let expected = home
+            .join(OPENROUTER_CONFIG_SUBDIR)
+            .join(OPENROUTER_ENV_FILE);
+        assert!(
+            expected.exists(),
+            "expected key file at {}",
+            expected.display()
+        );
+        assert!(
+            !home
+                .join(OPENROUTER_LEGACY_CONFIG_SUBDIR)
+                .join(OPENROUTER_ENV_FILE)
+                .exists(),
+            "save must not write to the legacy dir"
+        );
+
+        let loaded = load_openrouter_api_key().expect("key should load after save");
+        assert_eq!(loaded, "saved-key");
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# opencode — OpenRouter launcher for claw-code
-# Installed by install.sh to ~/.local/bin/opencode
+# openroutercode — OpenRouter launcher for claw-code
+# Installed by install.sh to ~/.local/bin/openroutercode
 # Browse OpenRouter's model catalog, pick a model, and launch claw.
 set -euo pipefail
 
@@ -10,7 +10,8 @@ if [ ! -x "$CLI_BIN" ]; then
   CLI_BIN="$REPO_ROOT/rust/target/release/claw"
 fi
 
-CONFIG_DIR="$HOME/.config/opencode"
+CONFIG_DIR="$HOME/.config/openroutercode"
+if [ ! -d "$CONFIG_DIR" ] && [ -d "$HOME/.config/opencode" ]; then CONFIG_DIR="$HOME/.config/opencode"; fi
 ENV_FILE="$CONFIG_DIR/.env"
 MODEL_FILE="$CONFIG_DIR/selected_model"
 RECENTS_FILE="$CONFIG_DIR/recent_models"

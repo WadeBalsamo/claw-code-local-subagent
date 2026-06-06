@@ -397,9 +397,15 @@ fi
 case "$PROVIDER" in
   openrouter)
     export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}"
-    if [ -z "${OPENAI_API_KEY:-}" ] && [ -f "$HOME/.config/opencode/.env" ]; then
-      # shellcheck disable=SC1091
-      source "$HOME/.config/opencode/.env" 2>/dev/null || true
+    if [ -z "${OPENAI_API_KEY:-}" ]; then
+      for _env_file in "$HOME/.config/openroutercode/.env" "$HOME/.config/opencode/.env"; do
+        if [ -f "$_env_file" ]; then
+          # shellcheck disable=SC1090
+          source "$_env_file" 2>/dev/null || true
+          break
+        fi
+      done
+      unset _env_file
     fi
     ;;
   lmstudio)

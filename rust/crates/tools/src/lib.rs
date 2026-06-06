@@ -3321,6 +3321,11 @@ fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::pa
     );
     push_skill_lookup_root(
         roots,
+        home.join(".config").join("openroutercode").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
         home.join(".config").join("opencode").join("skills"),
         SkillLookupOrigin::SkillsDir,
     );
