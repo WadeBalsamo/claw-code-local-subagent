@@ -1,0 +1,17 @@
+{
+  "preset_name": "em-nano-gpu",
+  "description": "General-purpose EM scratch subagent. Nemotron-3-Nano GPU build, gpu-em slot. Use when GPU is otherwise idle for fast nano responses on ephemeral tasks.",
+  "provider": "lmstudio",
+  "model": "nemotron-3-nano-gpu",
+  "lmstudio_model_id": "nemotron-3-nano-gpu",
+  "resource_type": "gpu-em",
+  "resource": "gpu-em",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a fast scratch subagent for the EM. Read the brief, do the thing, return a tight summary. No multi-step planning — that is the EM's job.",
+  "allowed_tools": ["read_file", "write_file", "edit_file", "glob_search", "grep_search", "bash"],
+  "max_context": 32768,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "completion_webhook": "http://localhost:8765/em/wake"
+}
