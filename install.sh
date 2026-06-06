@@ -407,7 +407,7 @@ Try it out:
   openroutercode
 
   ${COLOR_DIM}# Sub-agent entry point${COLOR_RESET}
-  run-claw-code --agent dev-frontend --dir /path/to/repo --plan "fix the bug"
+  run-claw-code --agent dev-coder-l0 --dir /path/to/repo --plan "fix the bug"
 
   ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
   claw prompt "summarize this repository"

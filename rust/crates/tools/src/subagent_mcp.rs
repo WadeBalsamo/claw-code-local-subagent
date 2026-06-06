@@ -161,7 +161,7 @@ pub fn run_subagent_tool_spec() -> ToolSpec {
 pub fn list_presets_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "list_presets",
-        description: "List the available sub-agent presets (name, description, provider, model) discoverable from the repo's scripts/presets and ~/.lmcode/presets.",
+        description: "List the available sub-agent presets (name, description, provider, model, tier_ref, resource) discoverable from the repo's scripts/presets and ~/.lmcode/presets. `tier_ref` keys into config/model_tiers.json for the hybrid local->OpenRouter ladder; `resource` is the broker slot (gpu/cpu/gpu+cpu/remote).",
         input_schema: json!({
             "type": "object",
             "properties": {},
@@ -669,6 +669,11 @@ pub struct PresetInfo {
     pub description: String,
     pub provider: String,
     pub model: String,
+    /// Orchestrator key into `config/model_tiers.json` (the hybrid local→OpenRouter
+    /// ladder). Empty for standalone presets that don't participate in tier routing.
+    pub tier_ref: String,
+    /// Resource-broker slot the local-first model holds: `gpu`/`cpu`/`gpu+cpu`/`remote`.
+    pub resource: String,
 }
 
 /// Enumerate presets from `<repo_root>/scripts/presets/*.json` and
@@ -725,6 +730,8 @@ fn collect_presets_from_dir(dir: &Path, seen: &mut BTreeSet<String>, out: &mut V
             description: string_field(&value, "description"),
             provider: string_field(&value, "provider"),
             model: string_field(&value, "model"),
+            tier_ref: string_field(&value, "tier_ref"),
+            resource: string_field(&value, "resource"),
         });
     }
 }
@@ -811,6 +818,26 @@ fn run_subagent_isolated(
         .arg(repo_dir)
         .arg("--plan")
         .arg(&input.prompt);
+    // Forward EXPLICIT caller overrides only. This is how an orchestrator dispatches a
+    // budget-gated OpenRouter rung onto a preset whose default is local. When the caller
+    // didn't specify, we leave them off so the launcher uses the preset's local-first
+    // defaults (passing the defaulted DeepSeek model here would wrongly override the preset).
+    if let Some(provider) = input
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "auto")
+    {
+        command.arg("--provider").arg(provider);
+    }
+    if let Some(model) = input
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.arg("--model").arg(model);
+    }
     if let Some(timeout) = input.timeout_secs {
         command.arg("--timeout").arg(timeout.to_string());
     }
@@ -1100,7 +1127,7 @@ mod tests {
         std::fs::create_dir_all(&presets_dir).expect("mkdir presets");
         std::fs::write(
             presets_dir.join("dev-coder.json"),
-            r#"{"preset_name":"dev-coder","description":"Local coder","provider":"lmstudio","model":"qwen-coder"}"#,
+            r#"{"preset_name":"dev-coder","description":"Local coder","provider":"lmstudio","model":"qwen-coder","tier_ref":"presets.dev-coder-l0","resource":"gpu"}"#,
         )
         .expect("write preset");
         std::fs::write(presets_dir.join("not-json.txt"), "ignore me").expect("write noise");
@@ -1130,6 +1157,8 @@ mod tests {
         assert_eq!(preset.description, "Local coder");
         assert_eq!(preset.provider, "lmstudio");
         assert_eq!(preset.model, "qwen-coder");
+        assert_eq!(preset.tier_ref, "presets.dev-coder-l0");
+        assert_eq!(preset.resource, "gpu");
     }
 
     #[test]

@@ -1,0 +1,23 @@
+{
+  "preset_name": "em-scratch",
+  "description": "General scratch worker for ephemeral analysis / synthesis. CPU-only, so parallel-safe with any GPU worker (no GPU mutex). Local-first nemotron-3-nano-30b (CPU); OpenRouter fallback resolved by the orchestrator from tier_ref.",
+  "tier_ref": "presets.em-worker",
+  "provider": "lmstudio",
+  "model": "nemotron-3-nano-30b",
+  "lmstudio_model_id": "nemotron-3-nano-30b",
+  "resource": "cpu",
+  "local_first": true,
+  "invoked_by": ["parker_em"],
+  "escalates_to": "EM",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a general-purpose scratch worker for the EM. Do the one-shot analysis or synthesis described in the brief and return a tight markdown result. No multi-step orchestration or planning — that is the EM's job. Read what you need from the working directory; do not edit files unless the brief explicitly asks for a write.",
+  "allowed_tools": ["read_file", "grep_search", "glob_search", "bash"],
+  "max_context": 32768,
+  "temperature": 0.3,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 1200
+}

@@ -1,0 +1,23 @@
+{
+  "preset_name": "dev-coder-l0",
+  "description": "Default L0 sprint coder. Simple slices: one file, a clear interface, a well-stated failing test. Local-first qwen3-coder-30b on the RTX 3090; OpenRouter fallback resolved by the orchestrator from tier_ref.",
+  "tier_ref": "presets.dev-coder-l0",
+  "provider": "lmstudio",
+  "model": "qwen3-coder-30b-a3b-q5",
+  "lmstudio_model_id": "qwen3-coder-30b-a3b-q5",
+  "resource": "gpu",
+  "local_first": true,
+  "invoked_by": ["parker_em"],
+  "escalates_to": "dev-coder-l1",
+  "env": {"OPENAI_BASE_URL": "http://localhost:1234/v1", "OPENAI_API_KEY": "lmstudio"},
+  "system_prompt": "You are a claw-code sprint coder: a stateless, one-shot engineer with no memory of past runs. You are given a brief and a working directory. Implement exactly the slice the brief describes — edit only the files it lists, make the cited failing test pass, and do not modify the test, refactor unrelated code, or touch any file outside the listed set. Read the codebase yourself (grep for symbols, open the cited files) rather than asking for context. Stop and return your diff once the cited test is green and no other test regresses. If the brief is underspecified, or the test cannot pass without touching a forbidden file, say so plainly in your summary instead of guessing.",
+  "allowed_tools": ["read_file", "edit_file", "grep_search", "glob_search", "bash"],
+  "max_context": 262144,
+  "temperature": 0.2,
+  "permission_mode": "danger-full-access",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "completion_webhook": "http://localhost:8765/claw-run-complete",
+  "timeout_seconds": 1800
+}
