@@ -19,6 +19,21 @@ mod input;
 mod render;
 mod setup_wizard;
 
+// Fork-only feature modules restored onto the upstream baseline.
+//
+// `args` is the legacy clap-based argument surface (kept for its tests and as
+// the canonical flag contract). `app` is the legacy in-process REPL prototype;
+// it is coupled to a `runtime::ConversationClient` streaming API that upstream
+// has since removed/renamed, so it is preserved behind an off-by-default
+// `legacy_app` feature rather than wired into the live binary (see final report
+// cross-crate notes). `setup`/`install` back the live `claw setup <target>` and
+// `claw install` subcommands wired below.
+#[cfg(feature = "legacy_app")]
+mod app;
+mod args;
+mod install;
+mod setup;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -1096,7 +1111,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::SessionList { output_format } => run_session_list(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::Setup { output_format: _ } => run_setup()?,
+        CliAction::Setup {
+            target,
+            model,
+            output_format: _,
+        } => run_setup(target, model)?,
+        CliAction::Install {
+            install_dir,
+            repo_root,
+            force,
+            output_format,
+        } => install::run_install(install_dir, repo_root, force, output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.
@@ -1241,6 +1266,19 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Setup {
+        // Fork feature: when `target` is `Some`, `claw setup <provider>` runs
+        // the fork's provider-specific setup (ollama/lmstudio/openrouter/models)
+        // from `setup.rs`. When `None`, `claw setup` falls back to upstream's
+        // interactive `setup_wizard`.
+        target: Option<setup::SetupTarget>,
+        model: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    // Fork feature: `claw install` installs the launcher shims to ~/.local/bin.
+    Install {
+        install_dir: Option<PathBuf>,
+        repo_root: Option<PathBuf>,
+        force: bool,
         output_format: CliOutputFormat,
     },
     // #146: `claw config` and `claw diff` are pure-local read-only
@@ -2151,15 +2189,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Init { output_format })
         }
-        "setup" => {
-            if rest.len() > 1 {
-                let extra = rest[1..].join(" ");
-                return Err(format!(
-                    "unexpected extra arguments after `claw setup`: {extra}\nUsage: claw setup"
-                ));
-            }
-            Ok(CliAction::Setup { output_format })
-        }
+        "setup" => parse_setup_args(&rest[1..], output_format),
+        "install" => parse_install_args(&rest[1..], output_format),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let mut read_stdin = false;
@@ -2330,10 +2361,15 @@ fn parse_single_word_command_alias(
 
     // Diagnostic verbs (help, version, status, sandbox, doctor, state) accept only the verb itself
     // or --help / -h as a suffix. Any other suffix args are unrecognized.
+    //
+    // Fork feature: `setup` is intentionally NOT diagnostic — `claw setup
+    // <provider> [model]` takes trailing args (ollama/lmstudio/openrouter/
+    // models), parsed in `parse_setup_args`. Bare `claw setup` still runs the
+    // interactive wizard.
     let verb = &rest[0];
     let is_diagnostic = matches!(
         verb.as_str(),
-        "help" | "version" | "status" | "sandbox" | "doctor" | "setup" | "state"
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state"
     );
 
     if is_diagnostic && rest.len() > 1 {
@@ -2471,7 +2507,11 @@ fn parse_single_word_command_alias(
                 .map(PermissionModeProvenance::from_flag)
                 .unwrap_or_else(permission_mode_provenance_for_current_dir),
         })),
-        "setup" => Some(Ok(CliAction::Setup { output_format })),
+        "setup" => Some(Ok(CliAction::Setup {
+            target: None,
+            model: None,
+            output_format,
+        })),
         "state" => Some(Ok(CliAction::State { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
@@ -2497,6 +2537,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "init"
             | "prompt"
             | "export"
+            | "install"
     ) {
         return None;
     }
@@ -2537,6 +2578,117 @@ fn unexpected_diff_args_error(extra: &[String]) -> String {
         "unexpected extra arguments after `claw diff`: {}\nUsage: claw diff",
         extra.join(" ")
     )
+}
+
+/// Parse `claw setup [ollama|lmstudio|openrouter|models] [model]`.
+///
+/// With no target, fall through to upstream's interactive setup wizard
+/// (`target: None`). `claw setup help` prints the fork's provider usage.
+fn parse_setup_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    use setup::SetupTarget;
+
+    let (target, model) = match args.first().map(String::as_str) {
+        // Bare `claw setup` runs the interactive wizard (upstream behavior).
+        None => (None, None),
+        Some("help") => {
+            return Err(String::from(concat!(
+                "claw setup [ollama|lmstudio|openrouter|models] [model]\n",
+                "  Wizard:        claw setup\n",
+                "  Ollama:        claw setup ollama [model]\n",
+                "  LM Studio:     claw setup lmstudio [model]\n",
+                "  OpenRouter:    claw setup openrouter [--list-models] [--set-key <key>] [model]\n",
+                "  Unified:       claw setup models",
+            )));
+        }
+        Some("ollama") => (Some(SetupTarget::Ollama), args.get(1).cloned()),
+        Some("lmstudio") => (Some(SetupTarget::LmStudio), args.get(1).cloned()),
+        Some("openrouter") => {
+            let mut model_hint = None;
+            let mut list_models = false;
+            let mut set_key = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--list-models" => list_models = true,
+                    "--set-key" => {
+                        i += 1;
+                        set_key = args.get(i).cloned();
+                    }
+                    flag if flag.starts_with("--set-key=") => {
+                        set_key = Some(flag["--set-key=".len()..].to_string());
+                    }
+                    other => model_hint = Some(other.to_string()),
+                }
+                i += 1;
+            }
+            (
+                Some(SetupTarget::OpenRouter {
+                    set_key,
+                    list_models,
+                }),
+                model_hint,
+            )
+        }
+        Some("models") => {
+            if args.len() > 1 {
+                return Err("claw setup models does not accept additional arguments".to_string());
+            }
+            (Some(SetupTarget::Models), None)
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown setup target: {other}. Use ollama, lmstudio, openrouter, or models."
+            ));
+        }
+    };
+    Ok(CliAction::Setup {
+        target,
+        model,
+        output_format,
+    })
+}
+
+/// Parse `claw install` flags: `--dir <path>` (install directory),
+/// `--repo-root <path>` (override repo-root detection), `--force`. Unknown
+/// arguments are rejected with a clear error, mirroring `parse_acp_args`.
+fn parse_install_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut install_dir: Option<PathBuf> = None;
+    let mut repo_root: Option<PathBuf> = None;
+    let mut force = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("`claw install --dir` requires a path argument"))?;
+                install_dir = Some(PathBuf::from(value));
+            }
+            "--repo-root" => {
+                let value = iter.next().ok_or_else(|| {
+                    String::from("`claw install --repo-root` requires a path argument")
+                })?;
+                repo_root = Some(PathBuf::from(value));
+            }
+            "--force" => force = true,
+            other => {
+                return Err(format!(
+                    "unsupported `claw install` argument: {other}. Use `--dir <path>`, `--repo-root <path>`, or `--force`."
+                ));
+            }
+        }
+    }
+
+    Ok(CliAction::Install {
+        install_dir,
+        repo_root,
+        force,
+        output_format,
+    })
 }
 
 fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
@@ -3750,9 +3902,42 @@ fn run_doctor(
     Ok(())
 }
 
-/// Run the interactive setup wizard to configure provider, API key, and model.
-fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
-    setup_wizard::run_setup_wizard()
+/// Run setup. With no target, run upstream's interactive wizard (provider,
+/// API key, model). With a fork target (`ollama`/`lmstudio`/`openrouter`/
+/// `models`), run the fork's provider-specific flow in `setup.rs`, then launch
+/// the REPL with the resolved provider env vars + model when requested.
+fn run_setup(
+    target: Option<setup::SetupTarget>,
+    model: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(target) = target else {
+        return setup_wizard::run_setup_wizard();
+    };
+
+    let result = setup::handle_setup(target, model)?;
+    match result.action {
+        setup::SetupAction::LaunchRepl => {
+            for (k, v) in &result.env {
+                env::set_var(k, v);
+            }
+            if let Some(model) = result.model {
+                run_repl(
+                    model,
+                    None,
+                    PermissionMode::DangerFullAccess,
+                    None,
+                    None,
+                    false,
+                )?;
+            }
+        }
+        setup::SetupAction::ListModelsOnly
+        | setup::SetupAction::SetKey
+        | setup::SetupAction::PrintVersion => {
+            // Already handled inside `setup::handle_setup`.
+        }
+    }
+    Ok(())
 }
 
 /// Starts a minimal Model Context Protocol server that exposes claw's
@@ -3826,6 +4011,74 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         server.run().await
     })?;
     Ok(())
+}
+
+/// Convert a [`tools::ToolSpec`] into the runtime's [`McpTool`] descriptor.
+#[cfg(feature = "subagent_mcp")]
+fn tool_spec_to_mcp_tool(spec: tools::ToolSpec) -> McpTool {
+    McpTool {
+        name: spec.name.to_string(),
+        description: Some(spec.description.to_string()),
+        input_schema: Some(spec.input_schema),
+        annotations: None,
+        meta: None,
+    }
+}
+
+/// Build the curated `claw mcp serve --subagents` spec: a purpose-built
+/// `run_subagent` + `list_presets` pair (instead of the entire raw toolbox),
+/// dispatched through [`tools::handle_subagent_mcp_call`].
+///
+/// Cross-crate dependency: this calls the tools crate's sub-agent MCP builder
+/// API (`tools::run_subagent_tool_spec`, `tools::list_presets_tool_spec`,
+/// `tools::handle_subagent_mcp_call`). Those live in `tools/src/subagent_mcp.rs`
+/// and must be re-exported from the tools crate root (the file exists but is
+/// not yet declared as `pub mod subagent_mcp;` in `tools/src/lib.rs` on this
+/// baseline — see the final report's cross-crate API section). Until that lands,
+/// this is gated behind the off-by-default `subagent_mcp` cargo feature so the
+/// crate (and CI) build green; flip the feature on once the tools crate
+/// re-exports the API.
+#[cfg(feature = "subagent_mcp")]
+fn build_subagent_mcp_spec() -> McpServerSpec {
+    let tools = vec![
+        tool_spec_to_mcp_tool(tools::run_subagent_tool_spec()),
+        tool_spec_to_mcp_tool(tools::list_presets_tool_spec()),
+    ];
+    McpServerSpec {
+        server_name: "claw-subagents".to_string(),
+        server_version: VERSION.to_string(),
+        tools,
+        tool_handler: Box::new(tools::handle_subagent_mcp_call),
+    }
+}
+
+/// Run `claw mcp serve --subagents`: an stdio MCP server exposing the curated
+/// sub-agent tools so a parent agent can spawn local/OpenRouter sub-agents.
+#[cfg(feature = "subagent_mcp")]
+fn run_subagent_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = build_subagent_mcp_spec();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut server = McpServer::new(spec);
+        server.run().await
+    })?;
+    Ok(())
+}
+
+/// Fallback when the `subagent_mcp` feature is off (the tools crate has not yet
+/// re-exported the sub-agent MCP builder API). Emits a clear, actionable error
+/// instead of silently dropping the command.
+#[cfg(not(feature = "subagent_mcp"))]
+fn run_subagent_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    Err(Box::<dyn std::error::Error>::from(
+        "`claw mcp serve --subagents` requires the `subagent_mcp` build feature, which depends on \
+         the tools crate re-exporting `run_subagent_tool_spec`/`list_presets_tool_spec`/\
+         `handle_subagent_mcp_call` (declare `pub mod subagent_mcp;` in tools/src/lib.rs). \
+         Rebuild with `--features subagent_mcp` once that API is available.",
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8556,8 +8809,17 @@ impl LiveCli {
         // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
-        if matches!(args.map(str::trim), Some("serve")) {
-            return run_mcp_serve();
+        //
+        // Fork feature: `claw mcp serve --subagents` (alias `serve subagents`)
+        // exposes the curated sub-agent surface (`run_subagent` + `list_presets`)
+        // instead of the full toolbox, for parents that orchestrate local /
+        // OpenRouter sub-agents.
+        match args.map(str::trim) {
+            Some("serve --subagents") | Some("serve subagents") => {
+                return run_subagent_mcp_serve();
+            }
+            Some("serve") => return run_mcp_serve(),
+            _ => {}
         }
         let cwd = env::current_dir()?;
         match output_format {

@@ -68,4 +68,11 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../../.git/refs");
     println!("cargo:rerun-if-changed=../../../.git/index");
+
+    // Rerun if any launcher script embedded by `src/install.rs` via
+    // `include_str!` changes. Paths are relative to this package root.
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/lmcode.sh");
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/ollamacode.sh");
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/openroutercode.sh");
+    println!("cargo:rerun-if-changed=../../../scripts/launchers/run-claw-code.sh");
 }
