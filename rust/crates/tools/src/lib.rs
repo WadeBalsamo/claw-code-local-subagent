@@ -4336,10 +4336,21 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
 }
 
 fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
-        PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-    )
+    agent_permission_policy_for_mode(PermissionMode::DangerFullAccess)
+}
+
+/// Build the sub-agent permission policy with a caller-chosen active mode.
+///
+/// Tool requirements come from [`mvp_tool_specs`] (the same per-tool minimums
+/// the in-process agent loop enforces); `active_mode` sets the ceiling the
+/// sub-agent runs under. Used by the `run_subagent` MCP tool to honor
+/// `permission_mode`.
+fn agent_permission_policy_for_mode(active_mode: PermissionMode) -> PermissionPolicy {
+    mvp_tool_specs()
+        .into_iter()
+        .fold(PermissionPolicy::new(active_mode), |policy, spec| {
+            policy.with_tool_requirement(spec.name, spec.required_permission)
+        })
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -6824,6 +6835,14 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 pub mod lane_completion;
 pub mod pdf_extract;
+mod subagent_mcp;
+pub mod workspace_jail;
+
+pub use subagent_mcp::{
+    apply_provider_env, handle_subagent_mcp_call, list_presets, list_presets_tool_spec,
+    read_openrouter_key, run_subagent, run_subagent_tool_spec, PresetInfo, ProviderEnvGuard,
+    RunSubagentInput, RunSubagentOutput,
+};
 
 #[cfg(test)]
 mod tests {

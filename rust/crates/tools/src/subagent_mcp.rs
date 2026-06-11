@@ -319,7 +319,10 @@ fn run_subagent_in_process(
     let prompt = input.prompt.clone();
 
     let run = move || -> Result<String, String> {
-        let system_prompt = build_agent_system_prompt(&subagent_type)?;
+        // Upstream's `build_agent_system_prompt` takes the model so it can
+        // select the right model-family identity block; pass the resolved
+        // model through (the fork's old 1-arg signature predated that).
+        let system_prompt = build_agent_system_prompt(&subagent_type, &model_owned)?;
         let mut runtime =
             build_subagent_runtime(model_owned, allowed_tools, permission_mode, system_prompt)?
                 .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
