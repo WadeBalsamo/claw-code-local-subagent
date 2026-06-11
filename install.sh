@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Claw Code installer
 #
-# Detects the host OS, verifies the Rust toolchain (rustc + cargo),
-# builds the `claw` binary from the `rust/` workspace, and runs a
-# post-install verification step. Supports Linux, macOS, and WSL.
+# Builds the `claw` binary from the `rust/` workspace and installs
+# the launcher shortcuts (lmcode, ollamacode, openroutercode, run-claw-code)
+# to ~/.local/bin/.
 #
 # Usage:
 #   ./install.sh                # debug build (fast, default)
@@ -42,7 +42,7 @@ else
 fi
 
 CURRENT_STEP=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 
 step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
@@ -61,7 +61,7 @@ print_banner() {
     cat <<'EOF'
    ____  _                   ____          _
   / ___|| |  __ _ __      __ / ___|___   __| | ___
- | |    | | / _` |\ \ /\ / /| |   / _ \ / _` |/ _ \
+ | |    | | / _` |\ \ / / /| |   / _ \ / _` |/ _ \
  | |___ | || (_| | \ V  V / | |__| (_) | (_| |  __/
   \____||_| \__,_|  \_/\_/   \____\___/ \__,_|\___|
 EOF
@@ -331,7 +331,29 @@ fi
 ok "built ${CLAW_BIN}"
 
 # ---------------------------------------------------------------------------
-# Step 5: post-install verification
+# Step 5: install launcher shortcuts to ~/.local/bin/
+# ---------------------------------------------------------------------------
+
+step "Installing launcher shortcuts"
+
+INSTALL_DIR="${HOME}/.local/bin"
+mkdir -p "${INSTALL_DIR}"
+
+# The launcher shortcuts (claw, lmcode, ollamacode, openroutercode,
+# run-claw-code) are now written by the Rust-native `claw install` subcommand.
+# It embeds the launcher bodies at compile time, injects CLAW_CODE_ROOT, and
+# synthesizes the `claw` shim — replacing the old cp + `sed` loop and heredoc.
+"${CLAW_BIN}" install --repo-root "${SCRIPT_DIR}"
+
+# Check if install dir is on PATH
+if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
+    warn "${INSTALL_DIR} is not in your PATH"
+    info "Add this to your ~/.bashrc or ~/.zshrc:"
+    info "  export PATH=\"\${HOME}/.local/bin:\${PATH}\""
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6: post-install verification
 # ---------------------------------------------------------------------------
 
 step "Verifying the installed binary"
@@ -358,7 +380,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: next steps
+# Step 7: next steps
 # ---------------------------------------------------------------------------
 
 step "Next steps"
@@ -366,28 +388,37 @@ step "Next steps"
 cat <<EOF
 ${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
 
-  Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
-  Profile: ${BUILD_PROFILE}
+  Binary:   ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
+  Profile:  ${BUILD_PROFILE}
+  Shortcuts: ${INSTALL_DIR}/{claw,lmcode,ollamacode,openroutercode,run-claw-code}
 
 Try it out:
 
-  ${COLOR_DIM}# interactive REPL${COLOR_RESET}
-  ${CLAW_BIN}
+  ${COLOR_DIM}# interactive REPL (from anywhere)${COLOR_RESET}
+  claw
+
+  ${COLOR_DIM}# LM Studio${COLOR_RESET}
+  lmcode
+
+  ${COLOR_DIM}# Ollama${COLOR_RESET}
+  ollamacode --model qwen3:27b
+
+  ${COLOR_DIM}# OpenRouter${COLOR_RESET}
+  openroutercode
+
+  ${COLOR_DIM}# Sub-agent entry point${COLOR_RESET}
+  run-claw-code --agent qwen3-coder-30b --dir /path/to/repo --plan "fix the bug"
 
   ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
-  ${CLAW_BIN} prompt "summarize this repository"
-
-  ${COLOR_DIM}# health check (run /doctor inside the REPL)${COLOR_RESET}
-  ${CLAW_BIN}
-  /doctor
+  claw prompt "summarize this repository"
 
 Authentication:
 
-  export ANTHROPIC_API_KEY="sk-ant-..."
-  ${COLOR_DIM}# or use OAuth:${COLOR_RESET}
-  ${CLAW_BIN} login
+  export ANTHROPIC_API_KEY="sk-ant-..."   # Anthropic
+  export OPENAI_API_KEY="sk-..."           # OpenAI
+  export OPENROUTER_API_KEY="..."          # OpenRouter
+  # Or just set OPENAI_API_KEY=ollama for local Ollama
 
-For deeper docs, see USAGE.md and rust/README.md.
 EOF
 
 # clear the failure trap on clean exit

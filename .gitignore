@@ -1,15 +1,53 @@
-__pycache__/
-archive/
-.omx/
-.clawd-agents/
+# Rust build artifacts
+target/
+Cargo.lock
+*.rs.bk
+*.pdb
+
+# Cargo cache
+.cargo/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
+.claude/
+plans/
 # Claw Code local artifacts
 .claw/settings.local.json
 .claw/sessions/
-.claw/rules.local/
-.clawhip/
-status-help.txt
-# Legacy Python port session scratch artifacts
-.port_sessions/
+.claw/
+.claw
+rust/.claw/
+rust/.claude/
+
+# Sandbox directories (contain rustup toolchains with large binaries)
+.sandbox-home/
+.sandbox-tmp/
+
+# Project config files (local only)
+.claude.json
+#.claw.json
+#.clawd-todos.json
+
+# GitHub related files
+.github/
+.gitignore
+conflicts.md
+plan.md
+claude.json
+clawd-todos.json
+
+# Python / scheduler artifacts
+__pycache__/
+*.pyc
+scripts/.clawd-todos.json
+
+# Backups / scratch
+*.bak
