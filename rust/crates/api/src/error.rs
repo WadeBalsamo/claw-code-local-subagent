@@ -79,6 +79,40 @@ pub enum ApiError {
         max_bytes: usize,
         provider: &'static str,
     },
+    // --- Local-model resilience errors (fork feature) ---
+    // These classify failure modes specific to local inference backends
+    // (LM Studio, Ollama, etc.) so the resilience layer in
+    // `local_model_recovery` can apply per-error retry budgets and
+    // streaming-degradation fallback. All but `StreamDebugInfo` are retryable.
+    /// Local model was unloaded by JIT memory management; warm up and retry.
+    LocalModelUnloaded {
+        provider: String,
+        model: String,
+        attempt: u32,
+    },
+    /// Stream opened but produced no assistant content or tool calls.
+    EmptyAssistantStream {
+        provider: String,
+        model: String,
+        attempt: u32,
+    },
+    /// No first output token within the configured timeout (slow prompt eval).
+    FirstTokenTimeout {
+        provider: String,
+        model: String,
+        timeout_ms: u64,
+    },
+    /// Tool sequence error - `tool_use` blocks must be followed by `tool_result`.
+    ToolSequenceError {
+        request_id: Option<String>,
+        body: String,
+    },
+    /// Stream debug info for diagnosing empty-stream issues. Not a failure state.
+    StreamDebugInfo {
+        message: String,
+        tokens_produced: Option<u32>,
+        stream_events: Vec<String>,
+    },
 }
 
 impl ApiError {
@@ -148,6 +182,13 @@ impl ApiError {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
+            // Local-model resilience errors are transient by construction.
+            Self::LocalModelUnloaded { .. }
+            | Self::EmptyAssistantStream { .. }
+            | Self::FirstTokenTimeout { .. }
+            | Self::ToolSequenceError { .. } => true,
+            // Diagnostic-only; never itself a failure to retry.
+            Self::StreamDebugInfo { .. } => false,
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
             | Self::ExpiredOAuthToken
@@ -165,6 +206,7 @@ impl ApiError {
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Api { request_id, .. } => request_id.as_deref(),
+            Self::ToolSequenceError { request_id, .. } => request_id.as_deref(),
             Self::RetriesExhausted { last_error, .. } => last_error.request_id(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
@@ -176,7 +218,11 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => None,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::LocalModelUnloaded { .. }
+            | Self::EmptyAssistantStream { .. }
+            | Self::FirstTokenTimeout { .. }
+            | Self::StreamDebugInfo { .. } => None,
         }
     }
 
@@ -202,6 +248,11 @@ impl ApiError {
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::RequestBodySizeExceeded { .. } => "request_size",
+            Self::LocalModelUnloaded { .. }
+            | Self::EmptyAssistantStream { .. }
+            | Self::FirstTokenTimeout { .. } => "local_model_recovery",
+            Self::ToolSequenceError { .. } => "provider_error",
+            Self::StreamDebugInfo { .. } => "provider_transport",
         }
     }
 
@@ -225,7 +276,12 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::LocalModelUnloaded { .. }
+            | Self::EmptyAssistantStream { .. }
+            | Self::FirstTokenTimeout { .. }
+            | Self::ToolSequenceError { .. }
+            | Self::StreamDebugInfo { .. } => false,
         }
     }
 
@@ -255,7 +311,12 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::LocalModelUnloaded { .. }
+            | Self::EmptyAssistantStream { .. }
+            | Self::FirstTokenTimeout { .. }
+            | Self::ToolSequenceError { .. }
+            | Self::StreamDebugInfo { .. } => false,
         }
     }
 }
@@ -398,6 +459,51 @@ impl Display for ApiError {
                 f,
                 "request body size ({estimated_bytes} bytes) exceeds {provider} limit ({max_bytes} bytes); reduce prompt length or context before retrying"
             ),
+            Self::LocalModelUnloaded {
+                provider,
+                model,
+                attempt,
+            } => write!(
+                f,
+                "local model {model} ({provider}) was unloaded; Claw will warm it up and retry (attempt {attempt})"
+            ),
+            Self::EmptyAssistantStream {
+                provider,
+                model,
+                attempt,
+            } => write!(
+                f,
+                "streaming produced no output for {model} ({provider}); Claw will retry with non-streaming (attempt {attempt})"
+            ),
+            Self::FirstTokenTimeout {
+                provider,
+                model,
+                timeout_ms,
+            } => write!(
+                f,
+                "first token timeout for {model} ({provider}) after {timeout_ms}ms; Claw will retry with extended timeout"
+            ),
+            Self::ToolSequenceError { request_id, body } => {
+                write!(f, "tool sequence error")?;
+                if let Some(request_id) = request_id {
+                    write!(f, " [trace {request_id}]")?;
+                }
+                write!(f, ": {body}")
+            }
+            Self::StreamDebugInfo {
+                message,
+                tokens_produced,
+                stream_events,
+            } => {
+                write!(f, "stream debug info: {message}")?;
+                if let Some(tokens) = tokens_produced {
+                    write!(f, " (tokens produced: {tokens})")?;
+                }
+                if !stream_events.is_empty() {
+                    write!(f, " (events: {})", stream_events.join(", "))?;
+                }
+                Ok(())
+            }
         }
     }
 }

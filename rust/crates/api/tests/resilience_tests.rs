@@ -26,6 +26,7 @@ mod resilience_config_tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // When checking resilience config with anthropic enabled
@@ -151,6 +152,7 @@ mod error_classification_tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // When classifying the error
@@ -179,6 +181,7 @@ mod error_classification_tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
+                retry_after: None,
             };
 
             // When checking if it's a context window failure
@@ -204,6 +207,7 @@ mod error_classification_tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // When classifying the error
@@ -238,6 +242,7 @@ mod error_classification_tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+                retry_after: None,
             },
             ApiError::Api {
                 status: StatusCode::BAD_GATEWAY,
@@ -247,6 +252,7 @@ mod error_classification_tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+                retry_after: None,
             },
         ];
 

@@ -223,6 +223,7 @@ mod resilience_mode_tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // Should be detected as model reloaded error
@@ -248,6 +249,7 @@ mod resilience_mode_tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
+                retry_after: None,
             };
 
             // Should be detected as context window failure
@@ -269,6 +271,7 @@ mod resilience_mode_tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // Should be detected as model unloaded error
@@ -326,6 +329,7 @@ mod resilience_mode_tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+                retry_after: None,
             },
             ApiError::Api {
                 status: StatusCode::BAD_GATEWAY,
@@ -335,6 +339,7 @@ mod resilience_mode_tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+                retry_after: None,
             },
             ApiError::ToolSequenceError {
                 request_id: Some("req-123".to_string()),
