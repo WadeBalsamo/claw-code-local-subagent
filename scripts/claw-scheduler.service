@@ -1,0 +1,34 @@
+[Unit]
+Description=claw-scheduler — Named resource scheduler for claw-code
+Documentation=https://github.com/ultraworkers/claw-code
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/local/bin/claw-scheduler --daemon --verbose
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=CLAW_SCHEDULER_POLL_INTERVAL=5
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=false  # We use /tmp/claw-runs as state dir
+PrivateDevices=true
+PrivateUsers=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

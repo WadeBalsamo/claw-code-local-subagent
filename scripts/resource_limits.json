@@ -1,0 +1,21 @@
+{
+  "resources": {
+    "gpu-exclusive": {"capacity": 1, "group": "gpu", "description": "Single GPU coder (qwen3-coder-30b-a3b ~20GB VRAM)"},
+    "gpu-em":        {"capacity": 1, "group": "gpu", "description": "EM Nemotron-3-Nano on GPU"},
+    "gpu-overflow":  {"capacity": 1, "group": "gpu", "description": "CTO 120B / 80B coder — GPU + CPU spill, no concurrent CPU bg"},
+    "cpu-bg":        {"capacity": 2, "group": "cpu", "description": "Background CPU tasks: test writer, test runner, doc writer"},
+    "remote":        {"capacity": 16, "group": "remote", "description": "OpenRouter calls — no local hardware lock"}
+  },
+  "mutex_groups": {
+    "gpu": {
+      "members": ["gpu-exclusive", "gpu-em", "gpu-overflow"],
+      "rule": "at_most_one_held_across_group"
+    }
+  },
+  "concurrent_rules": {
+    "gpu-overflow": {
+      "forbids_concurrent": ["cpu-bg"],
+      "reason": "120B overflows GPU into CPU; no headroom for cpu-bg"
+    }
+  }
+}

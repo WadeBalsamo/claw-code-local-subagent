@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "currency": "USD",
+    "unit": "per_million_tokens",
+    "last_refreshed": "2026-05-17",
+    "refresh_cadence_days": 90,
+    "source": "OpenRouter public pricing — hand-curated"
+  },
+  "models": {
+    "deepseek/deepseek-v4-flash":         {"input": 0.27,  "output": 1.10},
+    "anthropic/claude-sonnet-4-6":        {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-haiku-4-5":         {"input": 0.80,  "output": 4.00},
+    "anthropic/claude-opus-4-7":          {"input": 15.00, "output": 75.00}
+  },
+  "local_models_cost_usd": 0.0
+}
