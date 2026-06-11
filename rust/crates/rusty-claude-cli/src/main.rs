@@ -4031,13 +4031,8 @@ fn tool_spec_to_mcp_tool(spec: tools::ToolSpec) -> McpTool {
 ///
 /// Cross-crate dependency: this calls the tools crate's sub-agent MCP builder
 /// API (`tools::run_subagent_tool_spec`, `tools::list_presets_tool_spec`,
-/// `tools::handle_subagent_mcp_call`). Those live in `tools/src/subagent_mcp.rs`
-/// and must be re-exported from the tools crate root (the file exists but is
-/// not yet declared as `pub mod subagent_mcp;` in `tools/src/lib.rs` on this
-/// baseline — see the final report's cross-crate API section). Until that lands,
-/// this is gated behind the off-by-default `subagent_mcp` cargo feature so the
-/// crate (and CI) build green; flip the feature on once the tools crate
-/// re-exports the API.
+/// `tools::handle_subagent_mcp_call`), re-exported from `tools/src/subagent_mcp.rs`.
+/// Compiled under the `subagent_mcp` cargo feature, which is enabled by default.
 #[cfg(feature = "subagent_mcp")]
 fn build_subagent_mcp_spec() -> McpServerSpec {
     let tools = vec![

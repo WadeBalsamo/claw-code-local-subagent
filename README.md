@@ -26,7 +26,7 @@ Everything else — improved compaction, stream debugging, the named-resource sc
 claw-code plugs into **Claude Code** as a sub-agent over MCP: Claude Code stays the
 orchestrator and calls one tool — `run_subagent` — to hand bulk coding to a **local model**
 (LM Studio / Ollama) or a cheap **OpenRouter** model, and gets back a bounded result (status
-+ summary + diff stat), never the sub-agent's transcript. `claw mcp serve` is the stdio MCP
++ summary + diff stat), never the sub-agent's transcript. `claw mcp serve --subagents` is the stdio MCP
 server that exposes `run_subagent` and `list_presets`.
 
 ### 1. Build & install
@@ -50,7 +50,7 @@ Pick one. The tool Claude Code will expose is `mcp__claw-subagents__run_subagent
     "claw-subagents": {
       "type": "stdio",
       "command": "claw",
-      "args": ["mcp", "serve"],
+      "args": ["mcp", "serve", "--subagents"],
       "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
     }
   }
@@ -61,7 +61,7 @@ Pick one. The tool Claude Code will expose is `mcp__claw-subagents__run_subagent
 project` writes `.mcp.json`; `--scope user` writes your global `~/.claude.json`:
 
 ```bash
-claude mcp add --scope project claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve
+claude mcp add --scope project claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve --subagents
 ```
 
 ### 3. Auto-approve the tools (skip the per-call prompt)
@@ -296,7 +296,7 @@ two execution modes.
 
 Claude Code (running Sonnet) stays the **orchestrator**. claw-code becomes a cheap, sandboxed **sub-agent** it calls through a single MCP tool — `run_subagent` — to offload bulk coding work to a **local model** or an **OpenRouter model** (DeepSeek by default). You delegate to save Sonnet tokens and/or to run fully local, and you get back a **bounded result** (status + summary + diff stat), never the sub-agent's transcript.
 
-`claw mcp serve` is the bridge: a stdio MCP server that exposes exactly two tools — `run_subagent` and `list_presets`.
+`claw mcp serve --subagents` is the bridge: a stdio MCP server that exposes exactly two tools — `run_subagent` and `list_presets`.
 
 ### Step 1 — Install
 
@@ -360,16 +360,16 @@ If `claw doctor` reports the endpoint reachable and a smoke chat works, the back
 
 ### Step 4 — Register claw-code as an MCP sub-agent in Claude Code
 
-`claw mcp serve` is the server Claude Code spawns. Register it once:
+`claw mcp serve --subagents` is the server Claude Code spawns. Register it once:
 
 **OpenRouter:**
 ```bash
-claude mcp add claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve
+claude mcp add claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve --subagents
 ```
 
 **Local (Ollama / LM Studio)** — no key needed; just keep the local server running:
 ```bash
-claude mcp add claw-subagents -- claw mcp serve
+claude mcp add claw-subagents -- claw mcp serve --subagents
 ```
 
 **Project-scoped** (commit to share with a repo) — `.mcp.json`:
@@ -378,7 +378,7 @@ claude mcp add claw-subagents -- claw mcp serve
   "mcpServers": {
     "claw-subagents": {
       "command": "claw",
-      "args": ["mcp", "serve"],
+      "args": ["mcp", "serve", "--subagents"],
       "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
     }
   }
@@ -387,7 +387,7 @@ claude mcp add claw-subagents -- claw mcp serve
 
 Confirm inside Claude Code with `/mcp` — you should see `claw-subagents` exposing `run_subagent` and `list_presets`.
 
-**How the env flows:** Claude Code launches `claw mcp serve` as a child process and injects the `--env` (or `.mcp.json` `env`) values into it. Inside, `run_subagent` reads `OPENROUTER_API_KEY` (or the `~/.config/openroutercode/.env` → `~/.config/opencode/.env` fallback) for OpenRouter; for local providers it sets the localhost base URL itself.
+**How the env flows:** Claude Code launches `claw mcp serve --subagents` as a child process and injects the `--env` (or `.mcp.json` `env`) values into it. Inside, `run_subagent` reads `OPENROUTER_API_KEY` (or the `~/.config/openroutercode/.env` → `~/.config/opencode/.env` fallback) for OpenRouter; for local providers it sets the localhost base URL itself.
 
 ### Step 5 — Delegate work to the sub-agent from Claude Code
 
@@ -430,7 +430,7 @@ Discover ready-made (provider, model, system-prompt) bundles with the `list_pres
 Local inference is VRAM-bound, and that shapes how you run local sub-agents:
 
 - **One GPU usually holds one model.** Firing several local sub-agents at the same GPU forces the server to swap models (slow) or run out of VRAM. Plan for **one resident model per GPU**.
-- **A single Claude Code session is already serialized.** The MCP server processes `run_subagent` calls **one at a time**, so one Claude Code session won't fan out concurrent GPU hits through a given `claw mcp serve`.
+- **A single Claude Code session is already serialized.** The MCP server processes `run_subagent` calls **one at a time**, so one Claude Code session won't fan out concurrent GPU hits through a given `claw mcp serve --subagents`.
 - **For fleets / multiple orchestrators, use the named-resource scheduler.** Concurrency across *different* agents is where GPUs collide. Tag work to a named resource and the scheduler serializes it with `flock`:
   ```bash
   run-claw-code --agent qwen3-coder-30b --dir /repo --plan "..." \
@@ -446,7 +446,7 @@ Local inference is VRAM-bound, and that shapes how you run local sub-agents:
 
 OpenClaw is the orchestration system this fork was built for. There are two ways to give it claw-code as a sub-agent; both preserve the bounded-output contract.
 
-**Mode 1 — MCP tool (interactive, single result).** If your OpenClaw agent speaks MCP, register `claw mcp serve` exactly as in Step 4 and call `run_subagent` / `list_presets`. Best when the orchestrator wants one delegated result inline and lets claw manage provider/model.
+**Mode 1 — MCP tool (interactive, single result).** If your OpenClaw agent speaks MCP, register `claw mcp serve --subagents` exactly as in Step 4 and call `run_subagent` / `list_presets`. Best when the orchestrator wants one delegated result inline and lets claw manage provider/model.
 
 **Mode 2 — `run-claw-code` CLI contract (fleets, GPU scheduling, PRs).** The original design, and the better fit for many concurrent agents. OpenClaw shells out:
 ```bash
