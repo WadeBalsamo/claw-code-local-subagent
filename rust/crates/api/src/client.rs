@@ -3,6 +3,7 @@ use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
+use crate::resilience_config::ResilienceConfig;
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
 #[allow(clippy::large_enum_variant)]
@@ -23,21 +24,27 @@ impl ProviderClient {
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
+        // Local-model resilience config is read once and applied to the
+        // OpenAI-compatible clients; `should_enable_for_url` gates whether
+        // recovery actually engages (local base URLs only).
+        let resilience_config = ResilienceConfig::from_env();
         match providers::detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
             })),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::xai(),
-            )?)),
+            ProviderKind::Xai => Ok(Self::Xai(
+                OpenAiCompatClient::from_env(OpenAiCompatConfig::xai())?
+                    .with_resilience_config(resilience_config),
+            )),
             ProviderKind::OpenAi => {
                 // OLLAMA_HOST takes priority: local Ollama needs no API key
                 // and ignores DashScope/OpenAI env-based dispatch.
                 if std::env::var_os("OLLAMA_HOST").is_some() {
                     Ok(Self::OpenAi(
                         openai_compat::OpenAiCompatClient::from_ollama_env()
-                            .expect("from_ollama_env always returns Some"),
+                            .expect("from_ollama_env always returns Some")
+                            .with_resilience_config(resilience_config),
                     ))
                 } else {
                     // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
@@ -49,7 +56,10 @@ impl ProviderClient {
                         }
                         _ => OpenAiCompatConfig::openai(),
                     };
-                    Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                    Ok(Self::OpenAi(
+                        OpenAiCompatClient::from_env(config)?
+                            .with_resilience_config(resilience_config),
+                    ))
                 }
             }
         }

@@ -314,20 +314,56 @@ mod integration_tests {
 
     #[test]
     fn resilience_config_from_env_overrides_defaults() {
-        // This test requires environment variable manipulation
-        // Will be implemented in green phase with proper env var handling
-        assert!(true); // Placeholder
+        // `CLAW_RESILIENCE=force|none` maps to the force-enable/disable presets;
+        // an unset value preserves the documented defaults.
+        let previous = std::env::var_os("CLAW_RESILIENCE");
+
+        std::env::set_var("CLAW_RESILIENCE", "force");
+        assert!(
+            ResilienceConfig::from_env().is_enabled(),
+            "CLAW_RESILIENCE=force should force-enable resilience"
+        );
+
+        std::env::set_var("CLAW_RESILIENCE", "none");
+        assert!(
+            !ResilienceConfig::from_env().is_enabled(),
+            "CLAW_RESILIENCE=none should force-disable resilience"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("CLAW_RESILIENCE", value),
+            None => std::env::remove_var("CLAW_RESILIENCE"),
+        }
+
+        // Defaults: auto-enable for local endpoints, on for OpenAI-compatible.
+        let defaults = ResilienceConfig::default();
+        assert!(defaults.auto_enable_for_local);
+        assert!(defaults.enable_for_openai_compat);
+        assert!(!defaults.force_enable && !defaults.force_disable);
     }
 
     #[test]
     fn api_client_with_resilience_config_propagates_settings() {
-        // Given an API client with resilience config
-        let _client = api::AnthropicClient::new("test-key");
+        use api::{OpenAiCompatClient, OpenAiCompatConfig};
 
-        // When setting resilience config
-        let _config = ResilienceConfig::force_enable();
+        // force_enable propagates into the client and engages recovery even for
+        // a hosted (non-local) base URL.
+        let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+            .with_base_url("https://api.openai.com/v1")
+            .with_resilience_config(ResilienceConfig::force_enable());
+        assert!(
+            client.recovery_enabled(),
+            "force_enable resilience config should propagate and engage recovery"
+        );
 
-        // Then the config should be stored and accessible
-        assert!(true); // Placeholder - will verify in green phase
+        // force_disable propagates and suppresses recovery even for a local URL
+        // that would otherwise auto-enable it.
+        let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+            .with_base_url("http://127.0.0.1:1234/v1")
+            .with_resilience_config(ResilienceConfig::force_disable());
+        assert!(
+            !client.recovery_enabled(),
+            "force_disable resilience config should propagate and suppress recovery"
+        );
     }
 }

@@ -731,6 +731,59 @@ async fn provider_client_dispatches_xai_requests_from_env() {
     );
 }
 
+/// Regression guard: with local-model recovery engaged, `send_message`
+/// dispatches through `send_message_with_recovery` and still returns a
+/// correctly parsed completion. Prior to the resilience re-wiring the client
+/// never invoked the recovery path at all.
+#[tokio::test]
+async fn send_message_with_recovery_enabled_returns_parsed_completion() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_recovery\",",
+        "\"model\":\"grok-3\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Recovered hello\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url())
+        .with_recovery_enabled(true);
+    assert!(
+        client.recovery_enabled(),
+        "recovery should be engaged for this client"
+    );
+
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("recovery path should return a parsed completion");
+
+    assert_eq!(response.model, "grok-3");
+    assert_eq!(
+        response.content,
+        vec![OutputContentBlock::Text {
+            text: "Recovered hello".to_string(),
+        }]
+    );
+
+    let captured = state.lock().await;
+    assert_eq!(
+        captured.len(),
+        1,
+        "a single successful attempt should issue exactly one upstream request"
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,

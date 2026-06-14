@@ -9,6 +9,11 @@ use serde_json::{json, Value};
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
+use crate::local_model_recovery::{
+    ErrorClassifier, HealthProfileCache, ProviderCapabilities, RecoveryContext,
+    RecoveryStateMachine, RetryableErrorKind,
+};
+use crate::resilience_config::ResilienceConfig;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -106,7 +111,7 @@ impl OpenAiCompatConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     api_key: String,
@@ -115,6 +120,20 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    health_profiles: std::sync::Arc<HealthProfileCache>,
+    recovery_enabled: bool,
+    resilience_config: ResilienceConfig,
+}
+
+impl std::fmt::Debug for OpenAiCompatClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatClient")
+            .field("config", &self.config)
+            .field("base_url", &self.base_url)
+            .field("max_retries", &self.max_retries)
+            .field("recovery_enabled", &self.recovery_enabled)
+            .finish()
+    }
 }
 
 impl OpenAiCompatClient {
@@ -126,17 +145,46 @@ impl OpenAiCompatClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Whether local-model recovery is currently engaged for this client.
+    /// Gated by the resilience config against the client's base URL.
+    #[must_use]
+    pub fn recovery_enabled(&self) -> bool {
+        self.recovery_enabled
+    }
+
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        let base_url = read_base_url(config);
+        let resilience_config = ResilienceConfig::default();
+        let recovery_enabled = resilience_config.should_enable_for_url(&base_url);
         Self {
             http: build_http_client_or_default(),
             api_key: api_key.into(),
             config,
-            base_url: read_base_url(config),
+            base_url,
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            health_profiles: std::sync::Arc::new(HealthProfileCache::new()),
+            recovery_enabled,
+            resilience_config,
         }
+    }
+
+    /// Update the resilience configuration and re-evaluate whether local-model
+    /// recovery should be enabled for this client's base URL.
+    #[must_use]
+    pub fn with_resilience_config(mut self, resilience_config: ResilienceConfig) -> Self {
+        self.recovery_enabled = resilience_config.should_enable_for_url(&self.base_url);
+        self.resilience_config = resilience_config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_recovery_enabled(mut self, enabled: bool) -> Self {
+        self.recovery_enabled = enabled;
+        self
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
@@ -163,6 +211,8 @@ impl OpenAiCompatClient {
         let host =
             std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
         let base_url = format!("{}/v1", host.trim_end_matches('/'));
+        let resilience_config = ResilienceConfig::default();
+        let recovery_enabled = resilience_config.should_enable_for_url(&base_url);
         Some(Self {
             http: build_http_client_or_default(),
             api_key: "ollama".to_string(),
@@ -171,12 +221,19 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            health_profiles: std::sync::Arc::new(HealthProfileCache::new()),
+            recovery_enabled,
+            resilience_config,
         })
     }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        // Recompute recovery eligibility against the new base URL so callers
+        // that set the URL after construction (e.g. `from_env`) get correct
+        // local-model recovery gating.
+        self.recovery_enabled = self.resilience_config.should_enable_for_url(&self.base_url);
         self
     }
 
@@ -225,10 +282,39 @@ impl OpenAiCompatClient {
         request.model = canonical;
 
         preflight_message_request(&request)?;
-        let response = self.send_with_retry(&request).await?;
+
+        if self.recovery_enabled {
+            self.send_message_with_recovery(&request, &original_model)
+                .await
+        } else {
+            self.send_message_without_recovery(&request, &original_model)
+                .await
+        }
+    }
+
+    /// Single-shot completion path (transport-level retry only). Used when
+    /// local-model recovery is disabled (e.g. for hosted providers).
+    async fn send_message_without_recovery(
+        &self,
+        request: &MessageRequest,
+        original_model: &str,
+    ) -> Result<MessageResponse, ApiError> {
+        let response = self.send_with_retry(request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
-        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+        self.parse_completion_response(request, original_model, &body, request_id)
+    }
+
+    /// Parse a non-streaming completion body into a `MessageResponse`,
+    /// surfacing provider-side error envelopes as `ApiError::Api`.
+    fn parse_completion_response(
+        &self,
+        request: &MessageRequest,
+        original_model: &str,
+        body: &str,
+        request_id: Option<String>,
+    ) -> Result<MessageResponse, ApiError> {
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(body) {
             if let Some(err_obj) = raw.get("error") {
                 let msg = err_obj
                     .get("message")
@@ -248,7 +334,7 @@ impl OpenAiCompatClient {
                         .map(str::to_owned),
                     message: Some(msg),
                     request_id,
-                    body,
+                    body: body.to_string(),
                     retryable: false,
                     suggested_action: suggested_action_for_status(
                         reqwest::StatusCode::from_u16(code.unwrap_or(400))
@@ -258,15 +344,189 @@ impl OpenAiCompatClient {
                 });
             }
         }
-        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &original_model, &body, error)
+        let payload = serde_json::from_str::<ChatCompletionResponse>(body).map_err(|error| {
+            ApiError::json_deserialize(self.config.provider_name, original_model, body, error)
         })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
-        normalized.model = original_model;
+        normalized.model = original_model.to_string();
         Ok(normalized)
+    }
+
+    /// Completion path with local-model recovery: classifies failures
+    /// (model-unloaded, empty stream, first-token stall, transport/server
+    /// errors) and re-attempts with adaptive backoff via the recovery state
+    /// machine, updating the shared per-model health profile.
+    async fn send_message_with_recovery(
+        &self,
+        request: &MessageRequest,
+        original_model: &str,
+    ) -> Result<MessageResponse, ApiError> {
+        let capabilities =
+            ProviderCapabilities::for_provider(self.config.provider_name, &request.model);
+        let health_profile = self
+            .health_profiles
+            .get_or_create(&request.model, capabilities.first_token_timeout_ms);
+        let recovery_context = RecoveryContext::new(
+            self.config.provider_name.to_string(),
+            request.model.clone(),
+            health_profile,
+            capabilities,
+        );
+        let mut state_machine = RecoveryStateMachine::new(recovery_context);
+
+        loop {
+            state_machine.next_attempt();
+            let effective_request =
+                state_machine.mutate_request_for_attempt(request, state_machine.context().attempt);
+
+            match self.send_with_retry(&effective_request).await {
+                Ok(response) => {
+                    let request_id = request_id_from_headers(response.headers());
+                    let body = response.text().await.map_err(ApiError::from)?;
+                    match self.parse_completion_response(
+                        &effective_request,
+                        original_model,
+                        &body,
+                        request_id,
+                    ) {
+                        Ok(response) => {
+                            state_machine.record_success(effective_request.stream);
+                            self.health_profiles.update(
+                                &request.model,
+                                state_machine.context().health_profile.clone(),
+                            );
+                            return Ok(response);
+                        }
+                        Err(err) => {
+                            let error_kind = ErrorClassifier::classify(
+                                &err,
+                                self.config.provider_name,
+                                Some(&body),
+                            );
+                            state_machine.context_mut().last_error_kind = Some(error_kind);
+
+                            match error_kind {
+                                RetryableErrorKind::EmptyStream => {
+                                    state_machine.handle_empty_stream();
+                                    if state_machine.has_more_attempts() {
+                                        tokio::time::sleep(
+                                            state_machine.backoff_for_attempt(
+                                                state_machine.context().attempt,
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                RetryableErrorKind::ModelUnloaded => {
+                                    state_machine.handle_model_unloaded();
+                                    if state_machine.has_more_attempts() {
+                                        tokio::time::sleep(
+                                            state_machine.backoff_for_attempt(
+                                                state_machine.context().attempt,
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                RetryableErrorKind::FirstTokenStalled => {
+                                    state_machine.handle_first_token_timeout();
+                                    if state_machine.has_more_attempts() {
+                                        tokio::time::sleep(
+                                            state_machine.backoff_for_attempt(
+                                                state_machine.context().attempt,
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                RetryableErrorKind::TransportError
+                                | RetryableErrorKind::ServerError => {
+                                    if state_machine.has_more_attempts() {
+                                        tokio::time::sleep(
+                                            state_machine.backoff_for_attempt(
+                                                state_machine.context().attempt,
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                RetryableErrorKind::NonRetryable => {
+                                    self.health_profiles.update(
+                                        &request.model,
+                                        state_machine.context().health_profile.clone(),
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                            self.health_profiles.update(
+                                &request.model,
+                                state_machine.context().health_profile.clone(),
+                            );
+                            // Wrap in RetriesExhausted so the outer resilience
+                            // layer knows not to retry this prompt again.
+                            return Err(ApiError::RetriesExhausted {
+                                attempts: state_machine.context().attempt,
+                                last_error: Box::new(err),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    let error_kind =
+                        ErrorClassifier::classify(&err, self.config.provider_name, None);
+                    state_machine.context_mut().last_error_kind = Some(error_kind);
+
+                    match error_kind {
+                        RetryableErrorKind::ModelUnloaded => {
+                            state_machine.handle_model_unloaded();
+                            if state_machine.has_more_attempts() {
+                                tokio::time::sleep(
+                                    state_machine
+                                        .backoff_for_attempt(state_machine.context().attempt),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                        RetryableErrorKind::TransportError | RetryableErrorKind::ServerError => {
+                            if state_machine.has_more_attempts() {
+                                tokio::time::sleep(
+                                    state_machine
+                                        .backoff_for_attempt(state_machine.context().attempt),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                        _ => {
+                            self.health_profiles.update(
+                                &request.model,
+                                state_machine.context().health_profile.clone(),
+                            );
+                            return Err(err);
+                        }
+                    }
+
+                    self.health_profiles.update(
+                        &request.model,
+                        state_machine.context().health_profile.clone(),
+                    );
+                    // Wrap in RetriesExhausted so the outer resilience layer
+                    // knows not to retry this prompt again.
+                    return Err(ApiError::RetriesExhausted {
+                        attempts: state_machine.context().attempt,
+                        last_error: Box::new(err),
+                    });
+                }
+            }
+        }
     }
 
     pub async fn stream_message(
@@ -3035,5 +3295,49 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    // Regression guards for the local-model resilience wiring: prior to the
+    // upstream re-sync the recovery layer was defined but never invoked by the
+    // client. These assert the config is threaded in and gates recovery.
+    #[test]
+    fn resilience_config_force_enable_turns_recovery_on() {
+        let client = super::OpenAiCompatClient::new("k", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://api.openai.com/v1")
+            .with_resilience_config(crate::resilience_config::ResilienceConfig::force_enable());
+        assert!(
+            client.recovery_enabled(),
+            "force_enable resilience config should engage recovery even for a hosted URL"
+        );
+    }
+
+    #[test]
+    fn resilience_default_disables_recovery_for_hosted_url() {
+        let client = super::OpenAiCompatClient::new("k", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://api.openai.com/v1")
+            .with_resilience_config(crate::resilience_config::ResilienceConfig::default());
+        assert!(
+            !client.recovery_enabled(),
+            "default config should not engage recovery for a hosted (non-local) URL"
+        );
+    }
+
+    #[test]
+    fn resilience_default_enables_recovery_for_local_url() {
+        let client = super::OpenAiCompatClient::new("k", super::OpenAiCompatConfig::openai())
+            .with_base_url("http://127.0.0.1:1234/v1")
+            .with_resilience_config(crate::resilience_config::ResilienceConfig::default());
+        assert!(
+            client.recovery_enabled(),
+            "default config auto-enables recovery for a local base URL"
+        );
+    }
+
+    #[test]
+    fn with_recovery_enabled_overrides_gating() {
+        let client = super::OpenAiCompatClient::new("k", super::OpenAiCompatConfig::openai())
+            .with_base_url("https://api.openai.com/v1")
+            .with_recovery_enabled(true);
+        assert!(client.recovery_enabled());
     }
 }
