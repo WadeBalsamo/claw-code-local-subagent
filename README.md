@@ -104,6 +104,39 @@ The **Setup reference** below expands this: choosing/verifying a backend, the in
 
 ---
 
+## Use it as an adversarial reviewer with Claude Code as master
+
+When Claude Code drives the work, this fork can give it an independent, **read-only** second
+opinion on **every plan and every implementation** — a separate, disinterested model that
+re-derives the critique from the raw plan/diff and hunts for inert logic, missing edge cases,
+false-green tests, security regressions, and silent scope creep. This repo ships that wiring:
+
+- **Skill** — `.claude/skills/adversarial-review/SKILL.md` defines the review rubric and tells
+  Claude Code how to call `mcp__claw-subagents__run_subagent` with a read-only `Explore` sub-agent
+  and how to act on the structured verdict. Invoke it on demand for a deeper review.
+- **Hook (enforcement)** — `.claude/settings.json` registers two Claude Code hooks that run
+  `scripts/adversarial_review.sh`: a `PostToolUse` hook on `ExitPlanMode` reviews the **plan**, and
+  a `Stop` hook reviews the **implementation** diff. A `VERDICT: BLOCK` becomes a hook
+  `block` decision, so Claude must address the findings before finishing. The driver **fails open**
+  (a missing key, offline reviewer, or timeout skips the review rather than wedging the session).
+- **Headless reviewer** — `claw subagent run` runs the same curated `run_subagent` surface from a
+  shell and prints the structured `RunSubagentOutput` JSON, so the hook (or any master) gets the
+  same machine-readable `status`/`summary`/`diff_stat` contract as the MCP tool:
+
+  ```bash
+  echo "Review this diff: $(git diff)" | claw subagent run \
+    --provider openrouter --permission-mode read-only --subagent-type Explore
+  ```
+
+**Read-only is enforced**: `permission_mode: read-only` + `subagent_type: Explore` give the
+reviewer only read/search/web tools — it cannot edit, write, or mutate the workspace (a non-empty
+`diff_stat` would flag a violation). **The model is configurable**: the default is
+`deepseek/deepseek-v4-pro`; set `CLAW_REVIEW_MODEL` (or `CLAW_SUBAGENT_MODEL`) to repoint the
+reviewer at any OpenRouter model without editing the skill or hook. The reviewer is also available
+as the `adversarial-review` preset (`claw mcp` → `list_presets`).
+
+---
+
 ## Set it up as a coder worker for an autonomous agent fleet
 
 The fork's original purpose: let an **autonomous multi-agent system** — a department of

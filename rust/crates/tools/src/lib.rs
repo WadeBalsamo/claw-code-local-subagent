@@ -4246,12 +4246,25 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     Ok(prompt)
 }
 
+/// Resolve the sub-agent model with precedence: explicit caller value >
+/// `CLAW_SUBAGENT_MODEL` env > the built-in [`DEFAULT_AGENT_MODEL`].
+///
+/// The env step makes `CLAW_SUBAGENT_MODEL` an actual global override (as the
+/// README/docs and the `run_subagent` schema have long advertised), so a master
+/// can repoint every sub-agent — e.g. an adversarial reviewer — at one model
+/// without editing each call site.
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    if let Some(explicit) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        return explicit.to_string();
+    }
+    if let Some(env_model) = std::env::var("CLAW_SUBAGENT_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return env_model;
+    }
+    DEFAULT_AGENT_MODEL.to_string()
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -6895,6 +6908,31 @@ mod tests {
         assert!(poisoned.is_err(), "poisoning thread should panic");
 
         let _guard = env_guard();
+    }
+
+    #[test]
+    fn resolve_agent_model_precedence_explicit_env_default() {
+        let _guard = env_guard();
+        let prior = std::env::var("CLAW_SUBAGENT_MODEL").ok();
+
+        // Explicit caller value always wins, even when the env var is set.
+        std::env::set_var("CLAW_SUBAGENT_MODEL", "env/model");
+        assert_eq!(
+            super::resolve_agent_model(Some("explicit/model")),
+            "explicit/model"
+        );
+        // Blank/whitespace explicit value falls through to the env var.
+        assert_eq!(super::resolve_agent_model(Some("   ")), "env/model");
+        assert_eq!(super::resolve_agent_model(None), "env/model");
+
+        // With no env var, fall back to the built-in default.
+        std::env::remove_var("CLAW_SUBAGENT_MODEL");
+        assert_eq!(super::resolve_agent_model(None), super::DEFAULT_AGENT_MODEL);
+
+        match prior {
+            Some(value) => std::env::set_var("CLAW_SUBAGENT_MODEL", value),
+            None => std::env::remove_var("CLAW_SUBAGENT_MODEL"),
+        }
     }
 
     fn temp_path(name: &str) -> PathBuf {

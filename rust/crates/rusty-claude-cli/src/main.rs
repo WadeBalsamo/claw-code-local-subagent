@@ -1032,6 +1032,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             args,
             output_format,
         } => LiveCli::print_mcp(args.as_deref(), output_format)?,
+        CliAction::Subagent {
+            args,
+            output_format,
+        } => run_subagent_cli(&args, output_format)?,
         CliAction::Skills {
             args,
             output_format,
@@ -1199,6 +1203,15 @@ enum CliAction {
     },
     Mcp {
         args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    // Fork feature: `claw subagent run --prompt "..."` runs the curated
+    // `run_subagent` surface headlessly and prints the structured
+    // `RunSubagentOutput` JSON, giving a master (e.g. Claude Code, or a shell
+    // hook) the same machine-readable contract as the MCP tool without an MCP
+    // handshake. `args` keeps the raw argv tail so prompt boundaries survive.
+    Subagent {
+        args: Vec<String>,
         output_format: CliOutputFormat,
     },
     Skills {
@@ -1992,6 +2005,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
+            output_format,
+        }),
+        "subagent" => Ok(CliAction::Subagent {
+            args: rest[1..].to_vec(),
             output_format,
         }),
         // #145: `plugins` was routed through the prompt fallback because no
@@ -2967,6 +2984,7 @@ fn is_known_top_level_subcommand(value: &str) -> bool {
             | "agents"
             | "agent"
             | "mcp"
+            | "subagent"
             | "skills"
             | "skill"
             | "plugins"
@@ -4074,6 +4092,136 @@ fn run_subagent_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
          the tools crate re-exporting `run_subagent_tool_spec`/`list_presets_tool_spec`/\
          `handle_subagent_mcp_call` (declare `pub mod subagent_mcp;` in tools/src/lib.rs). \
          Rebuild with `--features subagent_mcp` once that API is available.",
+    ))
+}
+
+const SUBAGENT_RUN_USAGE: &str = "Usage: claw subagent run --prompt \"<task>\" \
+[--provider openrouter|local|lmstudio|ollama|anthropic|openai|auto] \
+[--model <id>] [--permission-mode read-only|workspace-write|danger-full-access] \
+[--subagent-type Explore|Plan|general-purpose|...] [--repo-dir <dir>] \
+[--max-output-chars <n>] [--timeout-secs <n>] [--preset <name>] [--isolated]\n\
+The prompt may also be piped on stdin instead of --prompt. Prints the structured \
+run_subagent JSON result (status/summary/diff_stat/...).";
+
+/// Parse the argv tail of `claw subagent run` into the `run_subagent` JSON
+/// argument object. Flags map 1:1 onto `RunSubagentInput` fields.
+#[cfg(feature = "subagent_mcp")]
+fn parse_subagent_run_args(args: &[String]) -> Result<Map<String, Value>, String> {
+    let mut obj = Map::new();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        // String-valued flags: (cli flag, json key).
+        let string_flag = match flag {
+            "--prompt" => Some("prompt"),
+            "--provider" => Some("provider"),
+            "--model" => Some("model"),
+            "--repo-dir" => Some("repo_dir"),
+            "--subagent-type" => Some("subagent_type"),
+            "--permission-mode" => Some("permission_mode"),
+            "--preset" => Some("preset"),
+            _ => None,
+        };
+        if let Some(key) = string_flag {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("flag `{flag}` requires a value.\n{SUBAGENT_RUN_USAGE}"))?;
+            obj.insert(key.to_string(), Value::String(value.clone()));
+            index += 2;
+            continue;
+        }
+        match flag {
+            "--max-output-chars" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `{flag}` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed: usize = raw.trim().parse().map_err(|_| {
+                    format!("--max-output-chars expects a non-negative integer, got `{raw}`")
+                })?;
+                obj.insert("max_output_chars".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--timeout-secs" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `{flag}` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed: u64 = raw.trim().parse().map_err(|_| {
+                    format!("--timeout-secs expects a non-negative integer, got `{raw}`")
+                })?;
+                obj.insert("timeout_secs".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--isolated" => {
+                obj.insert("isolated".into(), Value::Bool(true));
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown flag `{other}` for `claw subagent run`.\n{SUBAGENT_RUN_USAGE}"
+                ));
+            }
+        }
+    }
+    Ok(obj)
+}
+
+/// Run `claw subagent run`: a headless one-shot wrapper over the curated
+/// `run_subagent` tool. Builds the same JSON input the MCP server accepts,
+/// dispatches through `tools::handle_subagent_mcp_call`, and prints the
+/// structured result so a master/hook can branch on `status`/`summary`.
+#[cfg(feature = "subagent_mcp")]
+fn run_subagent_cli(
+    args: &[String],
+    _output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut rest = args.iter();
+    match rest.next().map(String::as_str) {
+        Some("run") => {}
+        Some(other) => {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "unknown `claw subagent` subcommand `{other}`.\n{SUBAGENT_RUN_USAGE}"
+            )));
+        }
+        None => {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "missing subcommand for `claw subagent`.\n{SUBAGENT_RUN_USAGE}"
+            )));
+        }
+    }
+
+    let tail: Vec<String> = rest.cloned().collect();
+    let mut obj = parse_subagent_run_args(&tail)?;
+
+    // Allow the prompt to arrive on stdin when --prompt is absent (e.g. a hook
+    // piping an assembled review context).
+    if !obj.contains_key("prompt") {
+        if let Some(piped) = read_piped_stdin() {
+            if !piped.trim().is_empty() {
+                obj.insert("prompt".into(), Value::String(piped));
+            }
+        }
+    }
+    if !obj.contains_key("prompt") {
+        return Err(Box::<dyn std::error::Error>::from(format!(
+            "no prompt provided: pass --prompt \"<task>\" or pipe it on stdin.\n{SUBAGENT_RUN_USAGE}"
+        )));
+    }
+
+    let result = tools::handle_subagent_mcp_call("run_subagent", &Value::Object(obj))
+        .map_err(Box::<dyn std::error::Error>::from)?;
+    println!("{result}");
+    Ok(())
+}
+
+/// Fallback when the `subagent_mcp` feature is off: mirror `run_subagent_mcp_serve`.
+#[cfg(not(feature = "subagent_mcp"))]
+fn run_subagent_cli(
+    _args: &[String],
+    _output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err(Box::<dyn std::error::Error>::from(
+        "`claw subagent run` requires the `subagent_mcp` build feature. \
+         Rebuild with `--features subagent_mcp`.",
     ))
 }
 
@@ -20328,5 +20476,53 @@ mod base_url_probe_tests {
             parse_base_url_host_port("http://:8080"),
             Some((":8080".to_string(), 80, "http".to_string()))
         );
+    }
+
+    #[cfg(feature = "subagent_mcp")]
+    #[test]
+    fn subagent_run_args_map_flags_to_json_keys() {
+        let args: Vec<String> = [
+            "--prompt",
+            "review this diff",
+            "--provider",
+            "openrouter",
+            "--model",
+            "deepseek/deepseek-v4-pro",
+            "--permission-mode",
+            "read-only",
+            "--subagent-type",
+            "Explore",
+            "--repo-dir",
+            "/tmp/repo",
+            "--max-output-chars",
+            "8000",
+            "--isolated",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+        let obj = super::parse_subagent_run_args(&args).expect("parses");
+        assert_eq!(obj["prompt"], "review this diff");
+        assert_eq!(obj["provider"], "openrouter");
+        assert_eq!(obj["model"], "deepseek/deepseek-v4-pro");
+        assert_eq!(obj["permission_mode"], "read-only");
+        assert_eq!(obj["subagent_type"], "Explore");
+        assert_eq!(obj["repo_dir"], "/tmp/repo");
+        assert_eq!(obj["max_output_chars"], 8000);
+        assert_eq!(obj["isolated"], true);
+    }
+
+    #[cfg(feature = "subagent_mcp")]
+    #[test]
+    fn subagent_run_args_reject_missing_value_and_unknown_flag() {
+        let missing: Vec<String> = vec!["--prompt".to_string()];
+        assert!(super::parse_subagent_run_args(&missing).is_err());
+
+        let unknown: Vec<String> = vec!["--bogus".to_string()];
+        assert!(super::parse_subagent_run_args(&unknown).is_err());
+
+        let bad_num: Vec<String> = vec!["--max-output-chars".to_string(), "notanumber".to_string()];
+        assert!(super::parse_subagent_run_args(&bad_num).is_err());
     }
 }
