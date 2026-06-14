@@ -3864,6 +3864,7 @@ fn render_doctor_report(
         checks: vec![
             check_auth_health(),
             check_base_url_health(),
+            check_openai_base_url_health(),
             check_config_health(&config_loader, config.as_ref()),
             check_mcp_validation_health(&mcp_validation),
             check_hook_validation_health(&hook_validation),
@@ -4246,6 +4247,179 @@ fn check_base_url_health() -> DiagnosticCheck {
         )
         .with_details(details)
         .with_hint("Fix the reported BASE_URL env vars or unset them to use provider defaults.")
+    }
+}
+
+/// Parse a base URL into `(host, port, scheme)` for a TCP reachability probe.
+/// Tolerates missing scheme, embedded userinfo, IPv6 literals, and explicit
+/// ports; returns `None` for empty or host-less inputs.
+fn parse_base_url_host_port(base_url: &str) -> Option<(String, u16, String)> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Split off an optional scheme. We lower-case only the scheme so the host
+    // (which may matter for SNI elsewhere) is preserved verbatim.
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("http".to_string(), trimmed),
+    };
+    let scheme = if scheme.is_empty() {
+        "http".to_string()
+    } else {
+        scheme
+    };
+
+    // The authority ends at the first `/`, `?`, or `#`.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .trim_end_matches('/');
+    // Strip any embedded userinfo (`user:pass@host`).
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    if authority.is_empty() {
+        return None;
+    }
+
+    let default_port = if scheme == "https" { 443 } else { 80 };
+
+    // IPv6 literal authority: `[::1]` or `[::1]:1234`.
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, after_host) = after_bracket.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = after_host
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_string(), port, scheme));
+    }
+
+    // IPv4 / hostname authority, optionally `host:port`.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port_str)) => {
+            // Only treat the trailing segment as a port if it parses; this
+            // guards against a stray colon producing an empty host.
+            match port_str.parse::<u16>() {
+                Ok(port) if !host.is_empty() => (host.to_string(), port),
+                _ => (authority.to_string(), default_port),
+            }
+        }
+        None => (authority.to_string(), default_port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, scheme))
+}
+
+/// Probe the local OpenAI-compatible endpoint (`OPENAI_BASE_URL`) for TCP
+/// reachability so `claw doctor` can distinguish "configured but server down"
+/// from "configured and reachable" — a syntax check alone reports OK for a
+/// downed local server.
+fn check_openai_base_url_health() -> DiagnosticCheck {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let base_url = env::var("OPENAI_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let Some(base_url) = base_url else {
+        return DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Ok,
+            "OPENAI_BASE_URL is not set; using the default endpoint",
+        )
+        .with_details(vec![
+            "Local provider    inactive (set OPENAI_BASE_URL or run `claw setup ollama|lmstudio|openrouter`)"
+                .to_string(),
+        ])
+        .with_data(Map::from_iter([
+            ("configured".to_string(), json!(false)),
+            ("base_url".to_string(), Value::Null),
+            ("reachable".to_string(), Value::Null),
+        ]));
+    };
+
+    let Some((host, port, scheme)) = parse_base_url_host_port(&base_url) else {
+        return DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Fail,
+            format!("OPENAI_BASE_URL is set but could not be parsed: {base_url}"),
+        )
+        .with_details(vec![
+            format!("Configured URL    {base_url}"),
+            "Suggested action  expected a URL like http://localhost:1234/v1; re-run `claw setup`"
+                .to_string(),
+        ])
+        .with_data(Map::from_iter([
+            ("configured".to_string(), json!(true)),
+            ("base_url".to_string(), json!(base_url)),
+            ("parsed".to_string(), json!(false)),
+            ("reachable".to_string(), json!(false)),
+        ]));
+    };
+
+    let endpoint = format!("{host}:{port}");
+    let timeout = Duration::from_secs(2);
+
+    // Resolve then connect with a bounded timeout. DNS resolution itself can
+    // block, but for the local-provider case (localhost/127.0.0.1) it is
+    // effectively instant; the connect_timeout caps the TCP handshake.
+    let resolve = endpoint.to_socket_addrs();
+    let (reachable, probe_note) = match resolve {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(_stream) => (true, format!("connected to {addr}")),
+                Err(error) => (false, format!("connect failed: {error}")),
+            },
+            None => (false, "address resolved to no socket addresses".to_string()),
+        },
+        Err(error) => (false, format!("could not resolve {endpoint}: {error}")),
+    };
+
+    let base_data = Map::from_iter([
+        ("configured".to_string(), json!(true)),
+        ("base_url".to_string(), json!(base_url)),
+        ("parsed".to_string(), json!(true)),
+        ("scheme".to_string(), json!(scheme)),
+        ("host".to_string(), json!(host)),
+        ("port".to_string(), json!(port)),
+        ("endpoint".to_string(), json!(endpoint)),
+        ("reachable".to_string(), json!(reachable)),
+    ]);
+
+    if reachable {
+        DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Ok,
+            format!("local OpenAI-compatible endpoint is reachable at {endpoint}"),
+        )
+        .with_details(vec![
+            format!("Configured URL    {base_url}"),
+            format!("Resolved endpoint {endpoint} ({scheme})"),
+            format!("Probe             {probe_note}"),
+        ])
+        .with_data(base_data)
+    } else {
+        DiagnosticCheck::new(
+            "OpenAI base URL",
+            DiagnosticLevel::Warn,
+            format!("OPENAI_BASE_URL is set but {endpoint} is not reachable"),
+        )
+        .with_details(vec![
+            format!("Configured URL    {base_url}"),
+            format!("Resolved endpoint {endpoint} ({scheme})"),
+            format!("Probe             {probe_note}"),
+            "Likely cause      the local server (LM Studio / Ollama / OpenRouter) may be down, or the URL is wrong"
+                .to_string(),
+            "Suggested action  start the server, or re-run `claw setup ollama|lmstudio|openrouter`"
+                .to_string(),
+        ])
+        .with_data(base_data)
     }
 }
 
@@ -20084,5 +20258,75 @@ mod alias_resolution_tests {
         assert!(validate_model_syntax("qwen3.6:27b-nvfp4").is_ok());
         // Empty model still rejected
         assert!(validate_model_syntax("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod base_url_probe_tests {
+    use super::parse_base_url_host_port;
+
+    #[test]
+    fn parse_base_url_host_port_defaults_scheme_and_port() {
+        // No scheme -> http, default port 80, path stripped.
+        assert_eq!(
+            parse_base_url_host_port("localhost/v1"),
+            Some(("localhost".to_string(), 80, "http".to_string()))
+        );
+        // http scheme, explicit port, path stripped.
+        assert_eq!(
+            parse_base_url_host_port("http://localhost:1234/v1"),
+            Some(("localhost".to_string(), 1234, "http".to_string()))
+        );
+        // https scheme defaults to 443 when port absent.
+        assert_eq!(
+            parse_base_url_host_port("https://openrouter.ai/api/v1"),
+            Some(("openrouter.ai".to_string(), 443, "https".to_string()))
+        );
+        // Explicit https port is honored.
+        assert_eq!(
+            parse_base_url_host_port("https://example.com:8443"),
+            Some(("example.com".to_string(), 8443, "https".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_base_url_host_port_handles_ipv4_ipv6_and_userinfo() {
+        // IPv4 with port (typical Ollama).
+        assert_eq!(
+            parse_base_url_host_port("http://127.0.0.1:11434/v1"),
+            Some(("127.0.0.1".to_string(), 11434, "http".to_string()))
+        );
+        // IPv6 literal with port.
+        assert_eq!(
+            parse_base_url_host_port("http://[::1]:1234/v1"),
+            Some(("::1".to_string(), 1234, "http".to_string()))
+        );
+        // IPv6 literal without port falls back to scheme default.
+        assert_eq!(
+            parse_base_url_host_port("https://[::1]/v1"),
+            Some(("::1".to_string(), 443, "https".to_string()))
+        );
+        // Userinfo is stripped from the authority.
+        assert_eq!(
+            parse_base_url_host_port("http://user:pass@host.example:9000/v1"),
+            Some(("host.example".to_string(), 9000, "http".to_string()))
+        );
+        // Scheme casing is normalized.
+        assert_eq!(
+            parse_base_url_host_port("HTTPS://Example.com"),
+            Some(("Example.com".to_string(), 443, "https".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_base_url_host_port_rejects_empty_or_hostless() {
+        assert_eq!(parse_base_url_host_port(""), None);
+        assert_eq!(parse_base_url_host_port("   "), None);
+        assert_eq!(parse_base_url_host_port("http://"), None);
+        // A bare port with no host should not yield an empty host.
+        assert_eq!(
+            parse_base_url_host_port("http://:8080"),
+            Some((":8080".to_string(), 80, "http".to_string()))
+        );
     }
 }
