@@ -414,7 +414,7 @@ fn format_ctx(ctx: u64) -> String {
 const OLLAMA_DEFAULT_HOST: &str = "127.0.0.1";
 const OLLAMA_DEFAULT_PORT: u16 = 11434;
 
-fn ollama_base_url() -> String {
+pub(crate) fn ollama_base_url() -> String {
     let host = env::var("OLLAMA_HOST").unwrap_or_else(|_| OLLAMA_DEFAULT_HOST.to_string());
     let port: u16 = env::var("OLLAMA_PORT")
         .ok()
@@ -759,7 +759,7 @@ pub fn save_openrouter_api_key(key: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn load_openrouter_api_key() -> Result<String, String> {
+pub(crate) fn load_openrouter_api_key() -> Result<String, String> {
     if let Ok(key) = env::var("OPENROUTER_API_KEY") {
         if !key.is_empty() {
             return Ok(key);
@@ -1104,6 +1104,126 @@ fn save_recent_api_model(model: &str) {
     models.insert(0, model.to_string());
     models.truncate(25);
     let _ = fs::write(&path, models.join("\n"));
+}
+
+// ── Reusable detection + pickers for the guided wizard ────────────────
+//
+// `setup_wizard.rs` drives a single guided flow across every provider and
+// reuses the probing, model-fetching and TUI-picker machinery here rather
+// than duplicating it.
+
+/// Availability + live model list for one local OpenAI-compatible provider
+/// (Ollama or LM Studio).
+pub(crate) struct LocalProviderStatus {
+    pub running: bool,
+    /// `host:port` for LM Studio, or the base URL for Ollama.
+    pub address: String,
+    pub models: Vec<ModelEntry>,
+    pub error: Option<String>,
+}
+
+impl LocalProviderStatus {
+    fn offline(address: String) -> Self {
+        Self {
+            running: false,
+            address,
+            models: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+/// Snapshot of every provider's availability, used to annotate the chooser.
+pub(crate) struct Detected {
+    pub ollama: LocalProviderStatus,
+    pub lmstudio: LocalProviderStatus,
+    /// An OpenRouter key already present in env / saved config, if any.
+    pub openrouter_key: Option<String>,
+}
+
+/// Probe Ollama and LM Studio (fetching model lists when reachable) and look
+/// up any existing OpenRouter key. All probes run on one short-lived runtime.
+pub(crate) fn detect_all() -> Detected {
+    let openrouter_key = load_openrouter_api_key().ok();
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(async {
+            Detected {
+                ollama: detect_ollama().await,
+                lmstudio: detect_lmstudio().await,
+                openrouter_key,
+            }
+        }),
+        Err(_) => Detected {
+            ollama: LocalProviderStatus::offline(ollama_base_url()),
+            lmstudio: LocalProviderStatus::offline(format!(
+                "{LMSTUDIO_DEFAULT_HOST}:{LMSTUDIO_DEFAULT_PORT}"
+            )),
+            openrouter_key,
+        },
+    }
+}
+
+async fn detect_ollama() -> LocalProviderStatus {
+    let address = ollama_base_url();
+    if !probe_ollama().await {
+        return LocalProviderStatus::offline(address);
+    }
+    match fetch_ollama_models().await {
+        Ok(models) => LocalProviderStatus {
+            running: true,
+            address,
+            models,
+            error: None,
+        },
+        Err(e) => LocalProviderStatus {
+            running: true,
+            address,
+            models: Vec::new(),
+            error: Some(e),
+        },
+    }
+}
+
+async fn detect_lmstudio() -> LocalProviderStatus {
+    match discover_lmstudio_address().await {
+        Ok(address) => match fetch_lmstudio_models(&address).await {
+            Ok(models) => LocalProviderStatus {
+                running: true,
+                address,
+                models,
+                error: None,
+            },
+            Err(e) => LocalProviderStatus {
+                running: true,
+                address,
+                models: Vec::new(),
+                error: Some(e),
+            },
+        },
+        Err(_) => {
+            LocalProviderStatus::offline(format!("{LMSTUDIO_DEFAULT_HOST}:{LMSTUDIO_DEFAULT_PORT}"))
+        }
+    }
+}
+
+/// Present the arrow-key model picker (falls back to a numbered stdin prompt).
+pub(crate) fn pick_model(models: &[ModelEntry], title: &str) -> Option<String> {
+    TuiPicker::pick(models, title)
+}
+
+/// Fetch tool-capable OpenRouter models as `ModelEntry` rows (with pricing).
+pub(crate) fn list_openrouter_models(api_key: &str) -> Result<Vec<ModelEntry>, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let models = rt.block_on(fetch_openrouter_models(api_key))?;
+    Ok(models
+        .into_iter()
+        .map(|m| ModelEntry {
+            id: m.id,
+            provider: "OpenRouter".to_string(),
+            context: Some(m.context_length),
+            note: format!("${:.2}/M", m.pricing_prompt * 1_000_000.0),
+        })
+        .collect())
 }
 
 // ── tests ─────────────────────────────────────────────────────────────

@@ -3930,7 +3930,21 @@ fn run_setup(
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(target) = target else {
-        return setup_wizard::run_setup_wizard();
+        let outcome = setup_wizard::run_setup_wizard()?;
+        if let Some(spec) = outcome.launch {
+            for (k, v) in &spec.env {
+                env::set_var(k, v);
+            }
+            run_repl(
+                spec.model,
+                None,
+                PermissionMode::DangerFullAccess,
+                None,
+                None,
+                false,
+            )?;
+        }
+        return Ok(());
     };
 
     let result = setup::handle_setup(target, model)?;
@@ -8759,8 +8773,18 @@ impl LiveCli {
                 false
             }
             SlashCommand::Setup => {
-                if let Err(e) = setup_wizard::run_setup_wizard() {
-                    eprintln!("Setup wizard failed: {e}");
+                // We're already inside a running session, so persist the
+                // chosen provider and tell the user to restart rather than
+                // launching a nested REPL.
+                match setup_wizard::run_setup_wizard() {
+                    Ok(outcome) => {
+                        if outcome.launch.is_some() {
+                            println!(
+                                "Provider saved. Restart claw (or use /model) to activate it."
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("Setup wizard failed: {e}"),
                 }
                 false
             }
