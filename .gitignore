@@ -14,10 +14,10 @@ Cargo.lock
 *.swo
 *~
 
-# Claude Code local artifacts
+# Claude Code local artifacts (but keep shared project config: settings.json, skills/)
 .claude/settings.local.json
 .claude/sessions/
-.claude/
+.claude/worktrees/
 plans/
 # Claw Code local artifacts
 .claw/settings.local.json
@@ -43,3 +43,11 @@ conflicts.md
 plan.md
 claude.json
 clawd-todos.json
+
+# Python / scheduler artifacts
+__pycache__/
+*.pyc
+scripts/.clawd-todos.json
+
+# Backups / scratch
+*.bak

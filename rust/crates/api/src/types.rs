@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,6 +33,14 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Provider-specific OpenAI-compatible request body parameters. These are
+    /// copied into the final JSON payload after core fields are populated so
+    /// users can opt into gateway features such as `web_search_options`,
+    /// `parallel_tool_calls`, or custom local-server switches without waiting
+    /// for first-class typed fields. Core protocol keys are protected and cannot
+    /// be overridden through this map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, Value>,
 }
 
 impl MessageRequest {
@@ -80,6 +90,11 @@ impl InputMessage {
 pub enum InputContentBlock {
     Text {
         text: String,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     ToolUse {
         id: String,
@@ -268,8 +283,9 @@ pub enum StreamEvent {
 #[cfg(test)]
 mod tests {
     use runtime::format_usd;
+    use serde_json::json;
 
-    use super::{MessageResponse, Usage};
+    use super::{InputContentBlock, MessageResponse, Usage};
 
     #[test]
     fn usage_total_tokens_includes_cache_tokens() {
@@ -306,5 +322,34 @@ mod tests {
         let cost = response.usage.estimated_cost_usd(&response.model);
         assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
         assert_eq!(response.total_tokens(), 1_800_000);
+    }
+
+    #[test]
+    fn input_content_block_thinking_serializes_with_snake_case_type() {
+        // given
+        let block = InputContentBlock::Thinking {
+            thinking: "pondering".to_string(),
+            signature: Some("sig_123".to_string()),
+        };
+
+        // when
+        let serialized = serde_json::to_value(&block).unwrap();
+        let deserialized: InputContentBlock = serde_json::from_value(json!({
+            "type": "thinking",
+            "thinking": "pondering",
+            "signature": "sig_123"
+        }))
+        .unwrap();
+
+        // then
+        assert_eq!(
+            serialized,
+            json!({
+                "type": "thinking",
+                "thinking": "pondering",
+                "signature": "sig_123"
+            })
+        );
+        assert_eq!(deserialized, block);
     }
 }

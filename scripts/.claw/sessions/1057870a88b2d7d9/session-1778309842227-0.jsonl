@@ -1,3 +1,0 @@
-{"created_at_ms":1778309842226,"model":"qwen/qwen3.5-9b","session_id":"session-1778309842227-0","type":"session_meta","updated_at_ms":1778309842226,"version":1,"workspace_root":"/home/wisgood/claw-code/scripts"}
-{"text":"write poem.txt","timestamp_ms":1778309845037,"type":"prompt_history"}
-{"message":{"blocks":[{"text":"write poem.txt","type":"text"}],"role":"user"},"type":"message"}

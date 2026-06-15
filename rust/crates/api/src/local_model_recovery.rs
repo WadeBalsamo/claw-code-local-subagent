@@ -413,6 +413,7 @@ mod tests {
             body: "Model unloaded.".to_string(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
         let kind = ErrorClassifier::classify(&error, "lm_studio", None);
         assert_eq!(kind, RetryableErrorKind::ModelUnloaded);

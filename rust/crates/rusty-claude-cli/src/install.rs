@@ -11,6 +11,9 @@
 //!
 //! The `claw` shim is synthesized to `exec` the running binary
 //! (`std::env::current_exe()`), matching the heredoc the installer used to emit.
+//!
+//! (Restored fork module; lint posture mirrors the crate root's broad allows.)
+#![allow(clippy::useless_conversion)]
 
 use std::path::{Path, PathBuf};
 

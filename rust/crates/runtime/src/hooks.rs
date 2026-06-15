@@ -7,11 +7,11 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -151,246 +151,15 @@ impl HookRunResult {
     }
 }
 
-// ============================================================================
-// Stream Debugging Hooks - For tracing and debugging API stream issues
-// ============================================================================
-
-/// Context passed to stream debugging hooks for tracking stream lifecycle.
-#[derive(Debug, Clone)]
-pub struct StreamDebugContext {
-    pub request_id: Option<String>,
-    pub model: String,
-    pub attempt: u32,
-    pub resilience_enabled: bool,
-    pub context_usage_percent: Option<f32>,
-    pub consecutive_failures: usize,
-    pub tokens_produced_so_far: Option<u32>,
-}
-
-impl StreamDebugContext {
-    #[must_use]
-    pub fn new(model: String, attempt: u32) -> Self {
-        Self {
-            request_id: None,
-            model,
-            attempt,
-            resilience_enabled: false,
-            context_usage_percent: None,
-            consecutive_failures: 0,
-            tokens_produced_so_far: None,
-        }
-    }
-
-    #[must_use]
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request_id = Some(request_id.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_resilience_enabled(mut self, enabled: bool) -> Self {
-        self.resilience_enabled = enabled;
-        self
-    }
-
-    #[must_use]
-    pub fn with_context_usage_percent(mut self, percent: f32) -> Self {
-        self.context_usage_percent = Some(percent);
-        self
-    }
-
-    #[must_use]
-    pub fn with_consecutive_failures(mut self, failures: usize) -> Self {
-        self.consecutive_failures = failures;
-        self
-    }
-
-    #[must_use]
-    pub fn with_tokens_produced(mut self, tokens: u32) -> Self {
-        self.tokens_produced_so_far = Some(tokens);
-        self
-    }
-}
-
-/// Result of a stream operation for debugging.
-#[derive(Debug, Clone)]
-pub struct StreamResult {
-    pub events_produced: usize,
-    pub tokens_produced: Option<u32>,
-    pub duration: Duration,
-    pub success: bool,
-}
-
-impl StreamResult {
-    #[must_use]
-    pub fn new(events_produced: usize, success: bool) -> Self {
-        Self {
-            events_produced,
-            tokens_produced: None,
-            duration: Duration::ZERO,
-            success,
-        }
-    }
-
-    #[must_use]
-    pub fn with_tokens(mut self, tokens: u32) -> Self {
-        self.tokens_produced = Some(tokens);
-        self
-    }
-
-    #[must_use]
-    pub fn with_duration(mut self, duration: Duration) -> Self {
-        self.duration = duration;
-        self
-    }
-}
-
-/// Trait for stream debugging hooks — allows monitoring and logging of
-/// stream lifecycle events to diagnose "no stream" / empty stream errors.
-pub trait HookStreamDebugger: Send {
-    /// Called when a stream starts.
-    fn on_stream_start(&mut self, context: &StreamDebugContext);
-
-    /// Called for each chunk received during streaming.
-    fn on_stream_chunk(&mut self, chunk: &[u8], context: &StreamDebugContext);
-
-    /// Called when a stream completes (successfully or not).
-    fn on_stream_end(&mut self, result: &StreamResult, context: &StreamDebugContext);
-
-    /// Called when a stream error occurs.
-    fn on_stream_error(&mut self, error: &str, context: &StreamDebugContext);
-}
-
-/// Capture of a stream debugging event.
-#[derive(Debug, Clone)]
-pub struct StreamDebugCapture {
-    pub timestamp: Instant,
-    pub model: String,
-    pub attempt: u32,
-    pub event_type: StreamDebugEventType,
-}
-
-/// The type of stream debug event that was captured.
-#[derive(Debug, Clone)]
-pub enum StreamDebugEventType {
-    Start,
-    Chunk { chunk_size: usize },
-    End { result: StreamResult },
-    Error { error_message: String },
-}
-
-/// Default executor for stream debugging hooks — captures debug info for testing.
-#[derive(Default)]
-pub struct StreamDebugExecutor {
-    captured_starts: Vec<StreamDebugCapture>,
-    captured_chunks: Vec<StreamDebugCapture>,
-    captured_ends: Vec<StreamDebugCapture>,
-    captured_errors: Vec<StreamDebugCapture>,
-}
-
-impl StreamDebugExecutor {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn captured_starts(&self) -> &[StreamDebugCapture] {
-        &self.captured_starts
-    }
-
-    #[must_use]
-    pub fn captured_chunks(&self) -> &[StreamDebugCapture] {
-        &self.captured_chunks
-    }
-
-    #[must_use]
-    pub fn captured_ends(&self) -> &[StreamDebugCapture] {
-        &self.captured_ends
-    }
-
-    #[must_use]
-    pub fn captured_errors(&self) -> &[StreamDebugCapture] {
-        &self.captured_errors
-    }
-}
-
-impl HookStreamDebugger for StreamDebugExecutor {
-    fn on_stream_start(&mut self, context: &StreamDebugContext) {
-        self.captured_starts.push(StreamDebugCapture {
-            timestamp: Instant::now(),
-            model: context.model.clone(),
-            attempt: context.attempt,
-            event_type: StreamDebugEventType::Start,
-        });
-    }
-
-    fn on_stream_chunk(&mut self, chunk: &[u8], context: &StreamDebugContext) {
-        self.captured_chunks.push(StreamDebugCapture {
-            timestamp: Instant::now(),
-            model: context.model.clone(),
-            attempt: context.attempt,
-            event_type: StreamDebugEventType::Chunk {
-                chunk_size: chunk.len(),
-            },
-        });
-    }
-
-    fn on_stream_end(&mut self, result: &StreamResult, context: &StreamDebugContext) {
-        self.captured_ends.push(StreamDebugCapture {
-            timestamp: Instant::now(),
-            model: context.model.clone(),
-            attempt: context.attempt,
-            event_type: StreamDebugEventType::End {
-                result: result.clone(),
-            },
-        });
-    }
-
-    fn on_stream_error(&mut self, error: &str, context: &StreamDebugContext) {
-        self.captured_errors.push(StreamDebugCapture {
-            timestamp: Instant::now(),
-            model: context.model.clone(),
-            attempt: context.attempt,
-            event_type: StreamDebugEventType::Error {
-                error_message: error.to_string(),
-            },
-        });
-    }
-}
-
-// ============================================================================
-// HookRunner
-// ============================================================================
-
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HookRunner {
     config: RuntimeHookConfig,
-    stream_debug_hooks: Vec<Box<dyn HookStreamDebugger>>,
-}
-
-impl Default for HookRunner {
-    fn default() -> Self {
-        Self {
-            config: RuntimeHookConfig::default(),
-            stream_debug_hooks: Vec::new(),
-        }
-    }
 }
 
 impl HookRunner {
     #[must_use]
     pub fn new(config: RuntimeHookConfig) -> Self {
-        Self {
-            config,
-            stream_debug_hooks: Vec::new(),
-        }
-    }
-
-    /// Set stream debugging hooks for monitoring stream lifecycle events.
-    #[must_use]
-    pub fn with_stream_debug_hooks(mut self, hooks: Vec<Box<dyn HookStreamDebugger>>) -> Self {
-        self.stream_debug_hooks = hooks;
-        self
+        Self { config }
     }
 
     #[must_use]
@@ -413,7 +182,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PreToolUse,
-            self.config.pre_tool_use(),
+            self.config.pre_tool_use_entries(),
             tool_name,
             tool_input,
             None,
@@ -463,7 +232,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUse,
-            self.config.post_tool_use(),
+            self.config.post_tool_use_entries(),
             tool_name,
             tool_input,
             Some(tool_output),
@@ -513,7 +282,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUseFailure,
-            self.config.post_tool_use_failure(),
+            self.config.post_tool_use_failure_entries(),
             tool_name,
             tool_input,
             Some(tool_error),
@@ -543,7 +312,7 @@ impl HookRunner {
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
-        commands: &[String],
+        commands: &[RuntimeHookCommand],
         tool_name: &str,
         tool_input: &str,
         tool_output: Option<&str>,
@@ -573,17 +342,21 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for command in commands
+            .iter()
+            .filter(|command| command.matches_tool(tool_name))
+        {
+            let command_text = command.command();
             if let Some(reporter) = reporter.as_deref_mut() {
                 reporter.on_event(&HookProgressEvent::Started {
                     event,
                     tool_name: tool_name.to_string(),
-                    command: command.clone(),
+                    command: command_text.to_string(),
                 });
             }
 
             match Self::run_command(
-                command,
+                command_text,
                 event,
                 tool_name,
                 tool_input,
@@ -597,7 +370,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -607,7 +380,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -619,7 +392,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -631,7 +404,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Cancelled {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     result.cancelled = true;
@@ -968,7 +741,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -1056,7 +829,7 @@ mod tests {
         HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
         HookRunner,
     };
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
 
     struct RecordingReporter {
@@ -1080,6 +853,37 @@ mod tests {
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    }
+
+    #[test]
+    fn object_style_hook_matchers_filter_runtime_execution() {
+        let runner = HookRunner::new(RuntimeHookConfig::from_hook_commands(
+            vec![
+                RuntimeHookCommand::new(shell_snippet("printf 'legacy'")),
+                RuntimeHookCommand::with_matcher(
+                    shell_snippet("printf 'bash only'"),
+                    Some("Bash".to_string()),
+                ),
+                RuntimeHookCommand::with_matcher(
+                    shell_snippet("printf 'read only'"),
+                    Some("Read*".to_string()),
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let read_result = runner.run_pre_tool_use("ReadFile", r#"{"path":"README.md"}"#);
+        let bash_result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+
+        assert_eq!(
+            read_result,
+            HookRunResult::allow(vec!["legacy".to_string(), "read only".to_string()])
+        );
+        assert_eq!(
+            bash_result,
+            HookRunResult::allow(vec!["legacy".to_string(), "bash only".to_string()])
+        );
     }
 
     #[test]
@@ -1333,111 +1137,6 @@ mod tests {
                 ..
             }
         )));
-    }
-
-    // ========================================================================
-    // Stream Debugging Hook Tests
-    // ========================================================================
-
-    #[test]
-    fn stream_debug_executor_captures_start_events() {
-        use super::HookStreamDebugger;
-        use super::StreamDebugContext;
-        use super::StreamDebugExecutor;
-
-        let mut executor = StreamDebugExecutor::new();
-        let ctx = StreamDebugContext::new("claude-3-5-sonnet".to_string(), 1)
-            .with_resilience_enabled(true);
-
-        executor.on_stream_start(&ctx);
-
-        assert_eq!(executor.captured_starts().len(), 1);
-        assert_eq!(executor.captured_starts()[0].model, "claude-3-5-sonnet");
-        assert_eq!(executor.captured_starts()[0].attempt, 1);
-    }
-
-    #[test]
-    fn stream_debug_executor_captures_chunk_events() {
-        use super::HookStreamDebugger;
-        use super::StreamDebugContext;
-        use super::StreamDebugExecutor;
-
-        let mut executor = StreamDebugExecutor::new();
-        let ctx = StreamDebugContext::new("claude-3-5-sonnet".to_string(), 1);
-
-        executor.on_stream_chunk(b"hello world", &ctx);
-
-        assert_eq!(executor.captured_chunks().len(), 1);
-        assert_eq!(executor.captured_chunks()[0].model, "claude-3-5-sonnet");
-        match &executor.captured_chunks()[0].event_type {
-            super::StreamDebugEventType::Chunk { chunk_size } => {
-                assert_eq!(*chunk_size, 11);
-            }
-            _ => panic!("expected Chunk event type"),
-        }
-    }
-
-    #[test]
-    fn stream_debug_executor_captures_end_events() {
-        use super::HookStreamDebugger;
-        use super::StreamDebugContext;
-        use super::StreamDebugExecutor;
-        use super::StreamResult;
-
-        let mut executor = StreamDebugExecutor::new();
-        let ctx = StreamDebugContext::new("claude-3-5-sonnet".to_string(), 1);
-        let result = StreamResult::new(5, true).with_tokens(42);
-
-        executor.on_stream_end(&result, &ctx);
-
-        assert_eq!(executor.captured_ends().len(), 1);
-        assert_eq!(executor.captured_ends()[0].model, "claude-3-5-sonnet");
-        match &executor.captured_ends()[0].event_type {
-            super::StreamDebugEventType::End { result } => {
-                assert_eq!(result.events_produced, 5);
-                assert_eq!(result.tokens_produced, Some(42));
-                assert!(result.success);
-            }
-            _ => panic!("expected End event type"),
-        }
-    }
-
-    #[test]
-    fn stream_debug_executor_captures_error_events() {
-        use super::HookStreamDebugger;
-        use super::StreamDebugContext;
-        use super::StreamDebugExecutor;
-
-        let mut executor = StreamDebugExecutor::new();
-        let ctx = StreamDebugContext::new("claude-3-5-sonnet".to_string(), 2)
-            .with_consecutive_failures(1);
-
-        executor.on_stream_error("empty stream: no content produced", &ctx);
-
-        assert_eq!(executor.captured_errors().len(), 1);
-        assert_eq!(executor.captured_errors()[0].attempt, 2);
-        match &executor.captured_errors()[0].event_type {
-            super::StreamDebugEventType::Error { error_message } => {
-                assert_eq!(error_message, "empty stream: no content produced");
-            }
-            _ => panic!("expected Error event type"),
-        }
-    }
-
-    #[test]
-    fn hook_runner_with_stream_debug_hooks() {
-        use super::HookStreamDebugger;
-        use super::StreamDebugContext;
-        use super::StreamDebugExecutor;
-
-        let executor = StreamDebugExecutor::new();
-        let runner = HookRunner::new(RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new()))
-            .with_stream_debug_hooks(vec![Box::new(executor)]);
-
-        // Verify the runner was constructed successfully with stream debug hooks
-        let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
-        assert!(!result.is_denied());
-        assert!(!result.is_failed());
     }
 
     #[cfg(windows)]

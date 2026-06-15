@@ -1,21 +1,35 @@
-/// `claw setup` — interactive setup for local and remote model providers.
-///
-/// Model selectors use crossterm-based arrow-key TUI when available
-/// (standard terminal), falling back to numbered list + readline.
-///
-/// ## Unified model browser (`claw setup models`)
-///
-/// Scans all local providers (Ollama, LM Studio) plus recently-used
-/// API models and presents a single interactive picker.
-///
-/// ## Per-provider (`claw setup ollama`, `claw setup lmstudio`)
-///
-/// Auto-discovers the provider, fetches available models, presents a
-/// TUI selector, and launches the REPL with correct env vars.
+//! `claw setup` — interactive setup for local and remote model providers.
+//!
+//! Model selectors use crossterm-based arrow-key TUI when available
+//! (standard terminal), falling back to numbered list + readline.
+//!
+//! ## Unified model browser (`claw setup models`)
+//!
+//! Scans all local providers (Ollama, LM Studio) plus recently-used
+//! API models and presents a single interactive picker.
+//!
+//! ## Per-provider (`claw setup ollama`, `claw setup lmstudio`)
+//!
+//! Auto-discovers the provider, fetches available models, presents a
+//! TUI selector, and launches the REPL with correct env vars.
+//!
+//! (Restored fork module; lint posture mirrors the crate root's broad allows.)
+#![allow(
+    clippy::manual_map,
+    clippy::needless_range_loop,
+    clippy::redundant_closure,
+    clippy::io_other_error,
+    clippy::manual_filter_map,
+    clippy::useless_conversion,
+    clippy::manual_let_else,
+    clippy::question_mark,
+    clippy::obfuscated_if_else
+)]
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -128,7 +142,7 @@ impl TuiPicker {
         if models.is_empty() {
             return None;
         }
-        if !atty::is(atty::Stream::Stdin) {
+        if !std::io::stdin().is_terminal() {
             // Fallback: auto-select first in non-interactive mode
             eprintln!("{} — auto-selecting first model: {}", title, models[0].id);
             return Some(models[0].id.clone());

@@ -108,7 +108,7 @@ fn status_command_applies_cli_flags_end_to_end() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            claude-sonnet-4-6"));
+    assert!(stdout.contains("Model            anthropic/claude-sonnet-4-6"));
     assert!(stdout.contains("Permission mode  read-only"));
 }
 
@@ -223,6 +223,73 @@ fn resume_latest_restores_the_most_recent_managed_session() {
 }
 
 #[test]
+fn resume_latest_missing_session_fails_without_creating_session_dirs_435() {
+    // given
+    let temp_dir = unique_temp_dir("resume-latest-missing-435");
+    let project_dir = temp_dir.join("project");
+    let config_home = temp_dir.join("config-home");
+    let home = temp_dir.join("home");
+    fs::create_dir_all(&project_dir).expect("project dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    let envs = [
+        (
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+        ("ANTHROPIC_API_KEY", ""),
+        ("ANTHROPIC_AUTH_TOKEN", ""),
+        ("OPENAI_API_KEY", ""),
+    ];
+
+    // when — both text and JSON resume failures should be non-zero and read-only.
+    let text = run_claw_with_env(&project_dir, &["--resume", "latest"], &envs);
+    let json = run_claw_with_env(
+        &project_dir,
+        &["--output-format", "json", "--resume", "latest"],
+        &envs,
+    );
+
+    // then
+    assert_eq!(
+        text.status.code(),
+        Some(1),
+        "text resume failure must be non-zero"
+    );
+    assert!(
+        text.stdout.is_empty(),
+        "text resume failure should not claim success on stdout: {}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    let text_stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        text_stderr.contains("no managed sessions found"),
+        "text failure should explain missing sessions: {text_stderr}"
+    );
+
+    assert_eq!(
+        json.status.code(),
+        Some(1),
+        "JSON resume failure must be non-zero"
+    );
+    assert!(
+        json.stderr.is_empty(),
+        "JSON resume failure should keep stderr empty: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&json.stdout)
+        .expect("JSON resume failure should emit JSON to stdout");
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["action"], "restore");
+    assert_eq!(parsed["error_kind"], "no_managed_sessions");
+    assert!(
+        !project_dir.join(".claw").exists(),
+        "failed resume must not create .claw/session directories"
+    );
+}
+
+#[test]
 fn resumed_status_command_emits_structured_json_when_requested() {
     // given
     let temp_dir = unique_temp_dir("resume-status-json");
@@ -268,7 +335,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert_eq!(parsed["kind"], "status");
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
-    assert_eq!(parsed["permission_mode"], "danger-full-access");
+    assert_eq!(parsed["permission_mode"], "workspace-write");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
     assert!(parsed["workspace"]["cwd"].as_str().is_some());
@@ -289,7 +356,7 @@ fn resumed_status_surfaces_persisted_model() {
     let session_path = temp_dir.join("session.jsonl");
 
     let mut session = workspace_session(&temp_dir);
-    session.model = Some("claude-sonnet-4-6".to_string());
+    session.model = Some("anthropic/claude-sonnet-4-6".to_string());
     session
         .push_user_text("model persistence fixture")
         .expect("write ok");
@@ -317,7 +384,7 @@ fn resumed_status_surfaces_persisted_model() {
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["kind"], "status");
     assert_eq!(
-        parsed["model"], "claude-sonnet-4-6",
+        parsed["model"], "anthropic/claude-sonnet-4-6",
         "model should round-trip through session metadata"
     );
 }
@@ -396,6 +463,9 @@ fn resumed_version_command_emits_structured_json() {
     assert!(parsed["version"].as_str().is_some());
     assert!(parsed["git_sha"].as_str().is_some());
     assert!(parsed["target"].as_str().is_some());
+    assert!(parsed["git_sha_short"].as_str().is_some());
+    assert!(parsed.get("message").is_none());
+    assert!(parsed["human_readable"].as_str().is_some());
 }
 
 #[test]
@@ -460,8 +530,9 @@ fn resumed_help_command_emits_structured_json() {
     let stdout = String::from_utf8(output.stdout).expect("utf8");
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["kind"], "help");
-    assert!(parsed["text"].as_str().is_some());
-    let text = parsed["text"].as_str().unwrap();
+    // #338: resume help now uses 'message' field for parity with top-level help
+    assert!(parsed["message"].as_str().is_some());
+    let text = parsed["message"].as_str().unwrap();
     assert!(text.contains("/status"), "help text should list /status");
 }
 
@@ -521,9 +592,17 @@ fn resumed_stub_command_emits_not_implemented_json() {
 
     // Stub commands exit with code 2
     assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("utf8");
-    let parsed: Value = serde_json::from_str(stderr.trim()).expect("should be json");
-    assert_eq!(parsed["type"], "error");
+    // #819/#820/#823: JSON abort envelopes route to stdout
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(
+        parsed["status"], "error",
+        "stub command should emit status:error"
+    );
+    assert_eq!(
+        parsed["kind"], "unsupported_command",
+        "stub command should emit kind:unsupported_command"
+    );
     assert!(
         parsed["error"]
             .as_str()

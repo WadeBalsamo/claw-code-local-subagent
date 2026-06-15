@@ -9,12 +9,27 @@ publish.workspace = true
 name = "claw"
 path = "src/main.rs"
 
+[features]
+# Enabled by default: the sub-agent MCP bridge is this fork's primary feature.
+default = ["subagent_mcp"]
+
+# Legacy in-process REPL prototype (`src/app.rs`). It targets a removed
+# `runtime::ConversationClient` streaming API, so it is disabled by default and
+# only compiled when explicitly requested. Re-enabling it requires a runtime
+# crate that re-exports `ConversationClient`/`StreamEvent`/`UsageSummary`.
+legacy_app = []
+
+# Curated `claw mcp serve --subagents` surface, dispatched through the tools
+# crate's `run_subagent_tool_spec`/`list_presets_tool_spec`/
+# `handle_subagent_mcp_call` (re-exported from `tools/src/subagent_mcp.rs`).
+# On by default; build with `--no-default-features` to drop it.
+subagent_mcp = []
+
 [dependencies]
 api = { path = "../api" }
+clap = { version = "4", features = ["derive"] }
 commands = { path = "../commands" }
-compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
-atty = "0.2"
 pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustyline = "15"
@@ -25,6 +40,8 @@ serde_json.workspace = true
 syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
+log = "0.4"
+
 
 [lints]
 workspace = true

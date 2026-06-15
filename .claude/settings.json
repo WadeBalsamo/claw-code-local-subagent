@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claw-subagents__run_subagent",
+      "mcp__claw-subagents__list_presets"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/adversarial_review.sh\" --mode plan"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/adversarial_review.sh\" --mode implementation"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -24,38 +24,43 @@ impl ProviderClient {
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
+        // Local-model resilience config is read once and applied to the
+        // OpenAI-compatible clients; `should_enable_for_url` gates whether
+        // recovery actually engages (local base URLs only).
         let resilience_config = ResilienceConfig::from_env();
         match providers::detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let client = match anthropic_auth {
-                    Some(auth) => AnthropicClient::from_auth(auth),
-                    None => AnthropicClient::from_env()?,
-                };
-                Ok(Self::Anthropic(
-                    client.with_resilience_config(resilience_config),
-                ))
-            }
-            ProviderKind::Xai => {
-                let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::xai())?;
-                Ok(Self::Xai(client.with_resilience_config(resilience_config)))
-            }
+            ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
+                Some(auth) => AnthropicClient::from_auth(auth),
+                None => AnthropicClient::from_env()?,
+            })),
+            ProviderKind::Xai => Ok(Self::Xai(
+                OpenAiCompatClient::from_env(OpenAiCompatConfig::xai())?
+                    .with_resilience_config(resilience_config),
+            )),
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                let config = match providers::metadata_for_model(&resolved_model) {
-                    Some(meta)
-                        if meta.auth_env == "DASHSCOPE_API_KEY"
-                            && std::env::var_os("OPENAI_BASE_URL").is_none() =>
-                    {
-                        OpenAiCompatConfig::dashscope()
-                    }
-                    _ => OpenAiCompatConfig::openai(),
-                };
-                let client = OpenAiCompatClient::from_env(config)?;
-                Ok(Self::OpenAi(
-                    client.with_resilience_config(resilience_config),
-                ))
+                // OLLAMA_HOST takes priority: local Ollama needs no API key
+                // and ignores DashScope/OpenAI env-based dispatch.
+                if std::env::var_os("OLLAMA_HOST").is_some() {
+                    Ok(Self::OpenAi(
+                        openai_compat::OpenAiCompatClient::from_ollama_env()
+                            .expect("from_ollama_env always returns Some")
+                            .with_resilience_config(resilience_config),
+                    ))
+                } else {
+                    // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
+                    // speak the OpenAI wire format, but they need the DashScope config which
+                    // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
+                    let config = match providers::metadata_for_model(&resolved_model) {
+                        Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
+                            OpenAiCompatConfig::dashscope()
+                        }
+                        _ => OpenAiCompatConfig::openai(),
+                    };
+                    Ok(Self::OpenAi(
+                        OpenAiCompatClient::from_env(config)?
+                            .with_resilience_config(resilience_config),
+                    ))
+                }
             }
         }
     }
@@ -175,7 +180,7 @@ mod tests {
 
     #[test]
     fn resolves_existing_and_grok_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-7");
         assert_eq!(resolve_model_alias("grok"), "grok-3");
         assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
     }
@@ -247,6 +252,24 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_openai_base_url_routes_authless_ollama_models() {
+        let _lock = env_lock();
+        let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
+        let _openai_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("test-anthropic-key"));
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let client = ProviderClient::from_model("qwen2.5-coder:7b")
+            .expect("local model should route to OpenAI-compatible client without auth");
+        match client {
+            ProviderClient::OpenAi(openai_client) => {
+                assert_eq!(openai_client.base_url(), "http://127.0.0.1:11434/v1")
+            }
+            other => panic!("Expected ProviderClient::OpenAi for local model, got: {other:?}"),
         }
     }
 }

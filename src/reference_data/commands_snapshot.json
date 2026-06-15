@@ -1033,15 +1033,5 @@
     "name": "voice",
     "source_hint": "commands/voice/voice.ts",
     "responsibility": "Command module mirrored from archived TypeScript path commands/voice/voice.ts"
-  },
-  {
-    "name": "install",
-    "source_hint": "rust/crates/rusty-claude-cli/src/install.rs",
-    "responsibility": "claw install subcommand: writes launcher shortcuts (claw, lmcode, ollamacode, openroutercode, run-claw-code) into ~/.local/bin with CLAW_CODE_ROOT embedded"
-  },
-  {
-    "name": "mcp serve",
-    "source_hint": "rust/crates/rusty-claude-cli/src/main.rs",
-    "responsibility": "claw mcp serve: stdio MCP server exposing the run_subagent and list_presets sub-agent tools to a parent agent"
   }
 ]
