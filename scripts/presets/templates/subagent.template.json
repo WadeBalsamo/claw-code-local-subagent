@@ -1,0 +1,31 @@
+{
+  "_template": "Copy this with scripts/new-subagent.sh <name>, or by hand into scripts/presets/<name>.json. Keys beginning with _ are documentation only and are stripped by the scaffold. See docs/subagents.md.",
+  "_fields": {
+    "preset_name": "Unique id; how you select the subagent (run_subagent preset, launcher --agent).",
+    "provider": "openrouter | local | lmstudio | ollama | anthropic | openai | auto.",
+    "model": "Provider model id (e.g. deepseek/deepseek-v4-pro, or a local model name).",
+    "resource": "Broker hint: remote | gpu | cpu | gpu+cpu (local-first scheduling).",
+    "system_prompt": "The subagent's role/instructions. Keep it self-contained.",
+    "allowed_tools": "Whitelist of tool names. Omit edit/write/bash for a read-only agent.",
+    "permission_mode": "read-only | workspace-write | danger-full-access.",
+    "max_context": "Max context tokens the model is told it has.",
+    "temperature": "Sampling temperature.",
+    "timeout_seconds": "Hard wall-clock bound for an isolated run.",
+    "tier_ref": "Optional orchestrator key into config/model_tiers.json for local->remote laddering."
+  },
+  "preset_name": "REPLACE_ME",
+  "description": "REPLACE_ME — one line on what this subagent is for.",
+  "provider": "openrouter",
+  "model": "deepseek/deepseek-v4-pro",
+  "resource": "remote",
+  "env": {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"},
+  "system_prompt": "You are a focused claw-code subagent. State your role and constraints here. You are read-only unless the preset grants write tools.",
+  "allowed_tools": ["read_file", "grep_search", "glob_search", "WebFetch", "WebSearch"],
+  "max_context": 131072,
+  "temperature": 0.1,
+  "permission_mode": "read-only",
+  "plan_mode": "normal",
+  "budget_gate": true,
+  "open_pr": false,
+  "timeout_seconds": 1200
+}

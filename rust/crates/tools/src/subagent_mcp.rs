@@ -780,8 +780,10 @@ fn locate_repo_root() -> Option<PathBuf> {
 ///   parse `status.json` + `summary.md` + `diff.patch` back into the output).
 /// - If `preset` is absent, we cannot honor `isolated: true` faithfully (a
 ///   synthesized temp preset would still need a resolvable model/provider and
-///   risks leaking secrets to a world-readable temp file), so we fall back to
-///   the in-process backend and note this in `error`.
+///   risks leaking secrets to a world-readable temp file), so we **fail fast**
+///   with `status: "failed"` rather than silently downgrade to the weaker
+///   in-process backend (a caller asking for a hard kill must not lose it
+///   unnoticed).
 fn run_subagent_isolated(
     input: &RunSubagentInput,
     provider: &str,
@@ -794,14 +796,17 @@ fn run_subagent_isolated(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        // No preset: fall back to in-process and explain.
-        let mut output = run_subagent_in_process(input, provider, model, repo_dir, Instant::now());
-        let note = "isolated:true requires a `preset` (the run-claw-code.sh launcher is preset-driven and has no ad-hoc provider/model flag); ran in-process instead";
-        output.error = Some(match output.error.take() {
-            Some(existing) => format!("{note}; underlying: {existing}"),
-            None => note.to_string(),
-        });
-        return output;
+        // No preset: fail fast. The launcher is preset-driven, so we cannot
+        // honor `isolated: true` (git worktree + hard `kill -9`) without one.
+        // Silently downgrading to the in-process backend would hand the caller
+        // a weaker isolation/cancellation model than they explicitly asked for,
+        // so we refuse instead of pretending.
+        return RunSubagentOutput::failed(
+            provider,
+            model,
+            repo_dir,
+            "isolated:true requires a `preset` (the run-claw-code.sh launcher is preset-driven and has no ad-hoc provider/model flag). Pass a `preset`, or drop `isolated` to run in-process.",
+        );
     };
 
     let Some(script) = locate_launcher_script() else {
@@ -1218,6 +1223,25 @@ mod tests {
         assert_eq!(
             parse_permission_mode(Some("danger-full-access")),
             PermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn isolated_without_preset_fails_fast_rather_than_downgrading() {
+        // `isolated: true` with no `preset` must NOT silently fall back to the
+        // in-process backend (which has no worktree / hard-kill). It returns a
+        // structured failure that names the missing `preset` — no network call.
+        let result = handle_subagent_mcp_call(
+            "run_subagent",
+            &json!({ "prompt": "review this", "isolated": true }),
+        )
+        .expect("ok json");
+        let value: Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["status"], "failed");
+        let error = value["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("preset"),
+            "error should explain the missing preset, got: {error}"
         );
     }
 

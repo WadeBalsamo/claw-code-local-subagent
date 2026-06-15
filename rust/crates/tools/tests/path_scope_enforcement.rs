@@ -26,6 +26,14 @@ fn workspace_write_registry() -> GlobalToolRegistry {
     GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy))
 }
 
+fn read_only_registry() -> GlobalToolRegistry {
+    let policy = mvp_tool_specs().into_iter().fold(
+        PermissionPolicy::new(PermissionMode::ReadOnly),
+        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+    );
+    GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy))
+}
+
 fn run_bash(command: &str) -> Result<String, String> {
     workspace_write_registry().execute("bash", &json!({ "command": command }))
 }
@@ -69,6 +77,45 @@ fn with_cwd<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
     let result = f();
     std::env::set_current_dir(previous).expect("restore cwd");
     result
+}
+
+#[test]
+fn read_only_subagent_mode_denies_outside_repo_reads() {
+    // A read-only sub-agent (e.g. the adversarial reviewer) resolves file tools
+    // through the same `execute_tool_with_enforcer` dispatch as GlobalToolRegistry,
+    // confined to the process cwd by `file_ops::validate_workspace_boundary`. That
+    // live enforcement is what makes the ported `workspace_jail` module redundant;
+    // this guards it so removing that module cannot silently regress confinement.
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = temp_path("read-only-repo");
+    fs::create_dir_all(root.join("src")).expect("create workspace");
+    fs::write(root.join("src/lib.rs"), "inside\n").expect("write inside file");
+    let outside = temp_path("read-only-secret.txt");
+    fs::write(&outside, "secret\n").expect("write outside file");
+
+    with_cwd(&root, || {
+        let registry = read_only_registry();
+        // Inside the repo: a read-only relative read is allowed.
+        let inside = registry
+            .execute("read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("in-repo read should succeed in read-only mode");
+        assert!(inside.contains("inside"));
+        // Absolute path to an existing file outside the repo: denied at the
+        // workspace boundary (`..` parent-escape of an existing file is covered
+        // by `nested_worktree_paths_are_allowed_but_parent_escape_is_denied`).
+        assert_permission_denied(
+            registry.execute(
+                "read_file",
+                &json!({ "path": outside.display().to_string() }),
+            ),
+            "read-only outside-repo read",
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(outside);
 }
 
 #[test]

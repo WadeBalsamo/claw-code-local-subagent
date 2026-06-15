@@ -11,10 +11,11 @@ Because the reviewer has no stake in the plan and re-derives its critique from t
 it catches the failure modes a self-review tends to rationalize: inert code, false-green tests,
 and silent scope creep.
 
-This skill is the canonical rubric. The same review also runs automatically via the `Stop` and
-`PostToolUse(ExitPlanMode)` hooks in `.claude/settings.json` (driver:
-`scripts/adversarial_review.sh`); invoke this skill directly when you want a deeper or ad-hoc
-review, or to re-review after addressing findings.
+The canonical review rubric lives in `.claude/skills/adversarial-review/rubric.md` — both this skill
+and the hook driver (`scripts/adversarial_review.sh`) feed that one file to the reviewer, so there is
+a single source of truth. The same review also runs automatically via the `Stop` and
+`PostToolUse(ExitPlanMode)` hooks in `.claude/settings.json`; invoke this skill directly when you want
+a deeper or ad-hoc review, or to re-review after addressing findings.
 
 ## When to run it
 
@@ -25,11 +26,13 @@ review, or to re-review after addressing findings.
 ## How to run it
 
 Call the MCP tool `mcp__claw-subagents__run_subagent` with a read-only Explore sub-agent. Build
-the prompt from the rubric below plus the artifact under review (the plan text, or the diff):
+the prompt from the canonical rubric (read `.claude/skills/adversarial-review/rubric.md` and use it
+verbatim), then the **user's original request and a short context summary**, then the artifact under
+review (the plan text, or the diff):
 
 ```json
 {
-  "prompt": "<the rubric below>\n\n=== ARTIFACT UNDER REVIEW ===\n<plan text and/or `git diff` output>",
+  "prompt": "<rubric verbatim>\n\n=== USER'S ORIGINAL REQUEST ===\n<the user's first prompt>\n\n=== CONVERSATION CONTEXT ===\n<your terse summary of the goal, constraints, key decisions, and what changed>\n\n=== ARTIFACT UNDER REVIEW ===\n<plan text and/or `git diff` output>",
   "provider": "openrouter",
   "permission_mode": "read-only",
   "subagent_type": "Explore",
@@ -38,38 +41,42 @@ the prompt from the rubric below plus the artifact under review (the plan text, 
 }
 ```
 
+You already hold the conversation, so write the request + context blocks yourself — the reviewer
+cannot judge scope/plan deviations without knowing what was actually asked. (The automatic hook path
+reconstructs the same two blocks from the session transcript, summarizing long conversations with a
+single OpenRouter call before the reviewer starts.)
+
 Notes:
-- **Read-only is enforced**: `permission_mode: "read-only"` + `subagent_type: "Explore"` give the
-  reviewer only `read_file`/`grep_search`/`glob_search`/web tools — no edit/write/bash-mutation.
-  A non-empty `diff_stat` in the result would indicate the reviewer changed something; it should
-  always be empty.
-- **Model is configurable**: omit `model` to use the default `deepseek/deepseek-v4-pro`, or set the
-  `CLAW_SUBAGENT_MODEL` env var (or pass `model`) to repoint at another OpenRouter model. The hook
-  driver reads `CLAW_REVIEW_MODEL` for the same purpose.
+- **Read-only is enforced** (two layers): `subagent_type: "Explore"` restricts the tool set to
+  exactly `read_file`, `grep_search`, `glob_search`, `WebFetch`, `WebSearch`, `ToolSearch`, `Skill`,
+  `StructuredOutput` — all read/search/report only — and `permission_mode: "read-only"` applies a
+  `PermissionEnforcer` policy on top. There is no edit/write/bash-mutation path. A non-empty
+  `diff_stat` in the result would indicate the reviewer changed something; it should always be empty.
+- **Model selection**: for a direct MCP call, an explicit `model` wins, else `CLAW_SUBAGENT_MODEL`,
+  else the default `deepseek/deepseek-v4-pro`. The hook driver additionally honors `CLAW_REVIEW_MODEL`,
+  which takes precedence over `CLAW_SUBAGENT_MODEL`. All resolve against OpenRouter.
 - Pass enough context: include the diff (`git diff` and `git diff --staged`) and, for a plan
   review, the full plan. The reviewer can read the rest of the repo itself.
 
 ## The review rubric (put this in the `prompt`)
 
-> You are an adversarial code reviewer. You are NOT the author and have no stake in the plan being
-> right — your job is to find what is wrong before it ships. You are read-only.
->
-> Re-derive the critique from first principles. Verify claims against the actual code; do not trust
-> comments or commit messages. Hunt specifically for:
-> - **Incorrect or inert logic**: code that compiles but does nothing, is never called, or doesn't
->   match the stated intent.
-> - **Missing edge cases / error handling**: empty/None, overflow, concurrency, partial failure,
->   untrusted input.
-> - **False-green or placeholder tests**: tests that assert nothing meaningful, are skipped/ignored,
->   are tautological, or mock away the thing under test.
-> - **Security regressions**: injection, path traversal, secret leakage, auth/permission bypass.
-> - **Scope / plan deviations**: changes outside the stated plan, dropped requirements, silently
->   weakened behavior.
->
-> Cite `file:line` for every finding. Be concrete and terse. End with exactly one verdict line:
-> `VERDICT: BLOCK` (followed by a numbered list of blocking issues, each with `file:line` and a
-> one-line fix) or `VERDICT: PASS` (with a one-line rationale). Minor style nits go under a
-> separate `Nits:` heading and never trigger BLOCK.
+The rubric is maintained as a single canonical file:
+**`.claude/skills/adversarial-review/rubric.md`**. Read that file and use its contents verbatim as
+the prefix of the `prompt`, followed by the artifact under review. Don't paraphrase or restate it
+here — one copy keeps this skill, the hook driver, and the preset from drifting apart.
+
+## Automatic enforcement (hooks)
+
+This review also runs **automatically**, even if you never invoke the skill:
+- `PostToolUse(ExitPlanMode)` reviews the plan; `Stop` reviews the working-tree diff. Both are wired
+  in `.claude/settings.json` and driven by `scripts/adversarial_review.sh`.
+- A `VERDICT: BLOCK` is **enforced**: the hook returns `{"decision":"block"}`, so you cannot finish
+  until the findings are addressed (or rebutted with evidence) and a re-review returns `VERDICT: PASS`.
+- Each run is a **real OpenRouter API call** (cost + latency), hard-bounded by `CLAW_REVIEW_TIMEOUT`
+  (default 180s).
+- The hook **fails open but loudly**: if `OPENROUTER_API_KEY` is unset, the `claw` binary is missing,
+  or the reviewer times out, the review is skipped with a visible banner + `systemMessage` — never
+  silently. Treat a skip as "no review ran" and fall back to your own judgment.
 
 ## How to act on the result
 

@@ -6849,7 +6849,6 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 pub mod lane_completion;
 pub mod pdf_extract;
 mod subagent_mcp;
-pub mod workspace_jail;
 
 pub use subagent_mcp::{
     apply_provider_env, handle_subagent_mcp_call, list_presets, list_presets_tool_spec,

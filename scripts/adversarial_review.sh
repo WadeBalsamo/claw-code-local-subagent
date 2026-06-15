@@ -11,14 +11,41 @@
 # a `VERDICT: BLOCK` becomes {"decision":"block","reason":...} so Claude must
 # address the findings before finishing; anything else lets Claude proceed.
 #
-# Design rule: FAIL OPEN. A missing key, offline reviewer, or parse error must
-# never hard-block the session — it degrades to "no review" with a stderr note.
+# Design rule: FAIL OPEN, BUT LOUDLY. A missing key, offline reviewer, or parse
+# error must never hard-block the session — it degrades to "no review", but with
+# a visible banner + systemMessage so the skip is never mistaken for a clean pass.
 #
-# Configuration (env):
-#   CLAW_REVIEW_MODEL     reviewer model (default: CLAW_SUBAGENT_MODEL, else deepseek/deepseek-v4-pro)
-#   CLAW_BIN              path to the claw binary (default: claw on PATH)
-#   CLAW_REVIEW_TIMEOUT   hard wall-clock bound on the reviewer, seconds (default: 180)
-#   OPENROUTER_API_KEY    required; without it the review is skipped (fail open)
+# Before invoking the reviewer we prepend the USER'S ORIGINAL REQUEST and a
+# CONVERSATION CONTEXT block, reconstructed from the hook payload's
+# `transcript_path`. The reviewer needs the user's intent to judge scope/plan
+# deviations — the plan/diff alone doesn't say what was actually asked. For long
+# transcripts we summarize the conversation with a single OpenRouter call first;
+# short ones are passed through (lightly trimmed). This is best-effort: if the
+# transcript is unavailable or the summary call fails, we degrade to whatever
+# context we have (at minimum the first prompt) and never block.
+#
+# Configuration. Everything below is also settable (without env vars) in the
+# claw-code settings file under an `adversarialReview` object — see
+# docs/subagents.md. Precedence: env var > settings file > built-in default.
+#
+#   Settings keys (.claude/settings.json -> "adversarialReview"):
+#     enabled                 set false to skip the review entirely (CLAW_REVIEW_FORCE overrides)
+#     model                   reviewer model
+#     timeoutSecs             hard wall-clock bound on the reviewer
+#     contextMaxTokens        token cap on the context summarized + sent to the reviewer
+#     contextThresholdTokens  token count above which the conversation is summarized
+#     contextModel            model used for the conversation summary
+#     contextTimeoutSecs      timeout for the summary OpenRouter call
+#
+#   Env overrides:
+#     CLAW_REVIEW_MODEL / CLAW_SUBAGENT_MODEL   reviewer model (default deepseek/deepseek-v4-pro)
+#     CLAW_BIN                                  path to the claw binary (default: claw on PATH)
+#     CLAW_REVIEW_TIMEOUT                       reviewer timeout, seconds (default 180)
+#     OPENROUTER_API_KEY                        required; without it the review is skipped (fail open)
+#     CLAW_REVIEW_CONTEXT_MODEL                 model for the conversation summary
+#     CLAW_REVIEW_CONTEXT_THRESHOLD             context CHAR count above which we summarize (default 12000)
+#     CLAW_REVIEW_CONTEXT_TIMEOUT               summary call timeout, seconds (default 60)
+#     CLAW_REVIEW_CONTEXT_MAX                   CHAR cap on the context block (default 100000 = 25k tokens)
 
 set -uo pipefail
 
@@ -35,13 +62,115 @@ PAYLOAD="$(cat 2>/dev/null || true)"
 
 PY="$(command -v python3 || command -v python || true)"
 CLAW_BIN="${CLAW_BIN:-claw}"
-REVIEW_MODEL="${CLAW_REVIEW_MODEL:-${CLAW_SUBAGENT_MODEL:-deepseek/deepseek-v4-pro}}"
-REVIEW_TIMEOUT="${CLAW_REVIEW_TIMEOUT:-180}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 note() { printf 'adversarial-review: %s\n' "$1" >&2; }
-fail_open() { note "$1 — skipping review"; exit 0; }
+
+# --- Settings (claw-code config) --------------------------------------------
+# Read the `adversarialReview` block from the project's claw-code settings so
+# the reviewer + context budget are configurable WITHOUT env vars. Precedence
+# is: env var > settings file > built-in default. `.claude/settings.local.json`
+# (machine-local) overrides `.claude/settings.json` (shared). Token-based
+# settings are converted to the script's internal char budget at ~4 chars/token.
+CHARS_PER_TOKEN=4
+AR_MODEL=""; AR_TIMEOUT=""; AR_CTX_MODEL=""; AR_CTX_TIMEOUT=""
+AR_CTX_MAX_TOKENS=""; AR_CTX_THRESHOLD_TOKENS=""; AR_ENABLED=""
+if [ -n "${PY:-}" ]; then
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      AR_MODEL) AR_MODEL="$_v" ;;
+      AR_TIMEOUT) AR_TIMEOUT="$_v" ;;
+      AR_CTX_MODEL) AR_CTX_MODEL="$_v" ;;
+      AR_CTX_TIMEOUT) AR_CTX_TIMEOUT="$_v" ;;
+      AR_CTX_MAX_TOKENS) AR_CTX_MAX_TOKENS="$_v" ;;
+      AR_CTX_THRESHOLD_TOKENS) AR_CTX_THRESHOLD_TOKENS="$_v" ;;
+      AR_ENABLED) AR_ENABLED="$_v" ;;
+    esac
+  done <<EOF
+$(CC_REPO="$REPO_DIR" "$PY" - <<'PYEOF' 2>/dev/null || true
+import os, json
+repo = os.environ.get("CC_REPO", ".")
+cfg = {}
+for name in (".claude/settings.json", ".claude/settings.local.json"):
+    try:
+        with open(os.path.join(repo, name)) as f:
+            ar = json.load(f).get("adversarialReview")
+        if isinstance(ar, dict):
+            cfg.update(ar)
+    except Exception:
+        pass
+keymap = {
+    "model": "AR_MODEL", "timeoutSecs": "AR_TIMEOUT",
+    "contextModel": "AR_CTX_MODEL", "contextTimeoutSecs": "AR_CTX_TIMEOUT",
+    "contextMaxTokens": "AR_CTX_MAX_TOKENS",
+    "contextThresholdTokens": "AR_CTX_THRESHOLD_TOKENS",
+    "enabled": "AR_ENABLED",
+}
+for k, var in keymap.items():
+    v = cfg.get(k)
+    if v is None or isinstance(v, (dict, list)):
+        continue
+    if isinstance(v, bool):
+        v = "true" if v else "false"
+    elif isinstance(v, float) and v.is_integer():
+        v = int(v)  # 25000.0 -> 25000 so the shell integer guard accepts it
+    print("%s=%s" % (var, v))
+PYEOF
+)
+EOF
+fi
+
+# Resolve effective config: env var > settings > default.
+REVIEW_MODEL="${CLAW_REVIEW_MODEL:-${CLAW_SUBAGENT_MODEL:-${AR_MODEL:-deepseek/deepseek-v4-pro}}}"
+REVIEW_TIMEOUT="${CLAW_REVIEW_TIMEOUT:-${AR_TIMEOUT:-180}}"
+CONTEXT_MODEL="${CLAW_REVIEW_CONTEXT_MODEL:-${AR_CTX_MODEL:-$REVIEW_MODEL}}"
+CONTEXT_TIMEOUT="${CLAW_REVIEW_CONTEXT_TIMEOUT:-${AR_CTX_TIMEOUT:-60}}"
+# Char budgets: explicit char env wins; else tokens-from-settings * chars/token;
+# else default. The token settings are integer-guarded BEFORE the arithmetic so a
+# malformed value (string, float, empty) falls back to the default instead of
+# crashing `$(( ))` under `set -u` (which would abort before fail_open could fire).
+if [ -n "${CLAW_REVIEW_CONTEXT_MAX:-}" ]; then
+  CONTEXT_MAX="$CLAW_REVIEW_CONTEXT_MAX"
+else
+  case "$AR_CTX_MAX_TOKENS" in
+    ''|*[!0-9]*) CONTEXT_MAX=100000 ;;
+    *) CONTEXT_MAX=$(( AR_CTX_MAX_TOKENS * CHARS_PER_TOKEN )) ;;
+  esac
+fi
+if [ -n "${CLAW_REVIEW_CONTEXT_THRESHOLD:-}" ]; then
+  CONTEXT_THRESHOLD="$CLAW_REVIEW_CONTEXT_THRESHOLD"
+else
+  case "$AR_CTX_THRESHOLD_TOKENS" in
+    ''|*[!0-9]*) CONTEXT_THRESHOLD=12000 ;;
+    *) CONTEXT_THRESHOLD=$(( AR_CTX_THRESHOLD_TOKENS * CHARS_PER_TOKEN )) ;;
+  esac
+fi
+
+# Settings can disable the review entirely (deliberate opt-out, not a failure).
+if [ "$AR_ENABLED" = "false" ] && [ -z "${CLAW_REVIEW_FORCE:-}" ]; then
+  note "disabled via adversarialReview.enabled=false in settings; skipping"
+  exit 0
+fi
+
+# FAIL OPEN, but LOUDLY. A missing key / offline reviewer / timeout must never
+# hard-block the session, but it must also never be mistaken for a clean review.
+# We emit a banner to stderr and, when python is available, a `systemMessage` on
+# stdout so the skip surfaces to the user and the model (not just buried logs).
+fail_open() {
+  printf '\n========================================\n' >&2
+  printf '⚠  adversarial-review SKIPPED: %s\n' "$1" >&2
+  printf '   No independent review ran — rely on your own judgment.\n' >&2
+  printf '========================================\n' >&2
+  if [ -n "${PY:-}" ]; then
+    REASON="$1" "$PY" - <<'PYEOF' || true
+import json, os
+msg = "⚠ adversarial-review SKIPPED: %s. No independent review ran — rely on your own judgment and say so to the user." % os.environ.get("REASON", "")
+print(json.dumps({"systemMessage": msg}))
+PYEOF
+  fi
+  exit 0
+}
 
 command -v "$CLAW_BIN" >/dev/null 2>&1 || fail_open "claw binary '$CLAW_BIN' not found"
 [ -n "$PY" ] || fail_open "python3 not found"
@@ -95,23 +224,156 @@ PYEOF
 ${DIFF}"
 fi
 
-# --- The adversarial rubric (kept in sync with the preset + SKILL.md) --------
-read -r -d '' RUBRIC <<'RUBRIC_EOF' || true
-You are an adversarial code reviewer. You are NOT the author and have no stake in the plan being right — your job is to find what is wrong before it ships. You are read-only.
+# --- The adversarial rubric --------------------------------------------------
+# Single canonical source: .claude/skills/adversarial-review/rubric.md. SKILL.md
+# and the preset's system_prompt mirror that file; this driver reads it directly
+# so the hook path can never silently drift from the canonical text.
+RUBRIC_FILE="$SCRIPT_DIR/../.claude/skills/adversarial-review/rubric.md"
+if [ -r "$RUBRIC_FILE" ]; then
+  RUBRIC="$(cat "$RUBRIC_FILE")"
+else
+  fail_open "rubric file not found at $RUBRIC_FILE"
+fi
 
-Re-derive the critique from first principles. Verify claims against the actual code; do not trust comments or commit messages. Hunt specifically for:
-- Incorrect or inert logic: code that compiles but does nothing, is never called, or doesn't match the stated intent.
-- Missing edge cases / error handling: empty/None, overflow, concurrency, partial failure, untrusted input.
-- False-green or placeholder tests: tests that assert nothing meaningful, are skipped/ignored, are tautological, or mock away the thing under test.
-- Security regressions: injection, path traversal, secret leakage, auth/permission bypass.
-- Scope / plan deviations: changes outside the stated plan, dropped requirements, silently weakened behavior.
+# --- User intent + conversation context --------------------------------------
+# The reviewer must see WHAT THE USER ASKED FOR, not just the plan/diff, or it
+# cannot judge scope/plan deviations. We rebuild this from the hook payload's
+# `transcript_path`: always include the user's first prompt; for long
+# transcripts, summarize the whole conversation with one OpenRouter call;
+# otherwise pass the (trimmed) conversation through. Best-effort — any failure
+# degrades to the first prompt (or nothing) and never blocks.
+TRANSCRIPT="$("$PY" - "$TMP/payload.json" <<'PYEOF'
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(d.get("transcript_path", "") or "")
+PYEOF
+)"
 
-Cite file:line for every finding. Be concrete and terse. End with exactly one verdict line: "VERDICT: BLOCK" (followed by a numbered list of blocking issues, each with file:line and a one-line fix) or "VERDICT: PASS" (with a one-line rationale). Minor style nits go under a separate "Nits:" heading and never trigger BLOCK.
-RUBRIC_EOF
+CONTEXT=""
+if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
+  CONTEXT="$(CTX_TRANSCRIPT="$TRANSCRIPT" \
+             CTX_THRESHOLD="$CONTEXT_THRESHOLD" \
+             CTX_MODEL="$CONTEXT_MODEL" \
+             CTX_TIMEOUT="$CONTEXT_TIMEOUT" \
+             CTX_MAX="$CONTEXT_MAX" \
+             "$PY" - <<'PYEOF' 2>/dev/null || true
+import os, json, urllib.request
 
-PROMPT="${RUBRIC}
+path = os.environ["CTX_TRANSCRIPT"]
+threshold = int(os.environ.get("CTX_THRESHOLD", "12000"))
+model = os.environ.get("CTX_MODEL", "")
+timeout = float(os.environ.get("CTX_TIMEOUT", "60"))
+api_key = os.environ.get("OPENROUTER_API_KEY", "")
+# Hard cap on history fed to the summarizer and on the context block we emit.
+max_chars = int(os.environ.get("CTX_MAX", "100000"))
+
+def message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return ""
+
+msgs = []
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            m = obj.get("message") if isinstance(obj, dict) else None
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = message_text(m.get("content")).strip()
+            if text:
+                msgs.append((role, text))
+except Exception:
+    msgs = []
+
+first_prompt = next((t for r, t in msgs if r == "user"), "")
+convo = "\n\n".join("[%s] %s" % (r, t) for r, t in msgs)
+
+summary = ""
+if len(convo) > threshold and api_key and model:
+    sys_prompt = (
+        "Summarize this Claude Code coding session into a brief for an "
+        "independent code reviewer. Capture: the user's original goal and any "
+        "explicit constraints, the key decisions and trade-offs made, what was "
+        "actually built/changed (file by file where it matters), and any open "
+        "concerns or deviations. Be factual with no preamble; thorough but "
+        "compact (target 300-800 words; go longer only for a large, complex "
+        "session)."
+    )
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": convo[:max_chars]},
+        ],
+        "temperature": 0.1,
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+        summary = (data["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        summary = ""
+
+blocks = []
+if first_prompt:
+    blocks.append("=== USER'S ORIGINAL REQUEST ===\n" + first_prompt)
+if summary:
+    blocks.append("=== CONVERSATION CONTEXT (summarized) ===\n" + summary)
+elif convo:
+    # No summary (short session, or summary call failed): send raw history up to
+    # the budget; only truncate when it exceeds the cap.
+    if len(convo) > max_chars:
+        convo = convo[:max_chars] + "\n...[context truncated]"
+    blocks.append("=== CONVERSATION CONTEXT ===\n" + convo)
+out = "\n\n".join(blocks)
+# Final guard: never emit a context block larger than the budget.
+if len(out) > max_chars:
+    out = out[:max_chars] + "\n...[context truncated]"
+print(out)
+PYEOF
+)"
+fi
+
+if [ -n "${CONTEXT//[[:space:]]/}" ]; then
+  PROMPT="${RUBRIC}
+
+${CONTEXT}
 
 ${ARTIFACT}"
+else
+  note "no transcript context available; reviewing artifact without user-intent context"
+  PROMPT="${RUBRIC}
+
+${ARTIFACT}"
+fi
 
 # --- Run the read-only reviewer ----------------------------------------------
 # Hard-bound the call: the restored resilience layer retries failed network

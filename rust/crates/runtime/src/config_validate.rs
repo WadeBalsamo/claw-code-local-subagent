@@ -220,6 +220,47 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "subagentModel",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "adversarialReview",
+        expected: FieldType::Object,
+    },
+];
+
+/// Keys under the `adversarialReview` settings object. These tune the read-only
+/// adversarial reviewer and the conversation-context budget that the hook driver
+/// (`scripts/adversarial_review.sh`) sends to it. Environment variables of the
+/// same purpose still override these at run time.
+const ADVERSARIAL_REVIEW_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "timeoutSecs",
+        expected: FieldType::Number,
+    },
+    // Token cap on the conversation context summarized and sent to the reviewer.
+    FieldSpec {
+        name: "contextMaxTokens",
+        expected: FieldType::Number,
+    },
+    // Token count above which the conversation is summarized rather than sent raw.
+    FieldSpec {
+        name: "contextThresholdTokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "contextModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "contextTimeoutSecs",
+        expected: FieldType::Number,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -555,6 +596,18 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
+    if let Some(adversarial_review) = object
+        .get("adversarialReview")
+        .and_then(JsonValue::as_object)
+    {
+        result.merge(validate_object_keys(
+            adversarial_review,
+            ADVERSARIAL_REVIEW_FIELDS,
+            "adversarialReview",
+            source,
+            &path_display,
+        ));
+    }
 
     result
 }
@@ -634,6 +687,60 @@ mod tests {
                 got: "a number"
             }
         ));
+    }
+
+    #[test]
+    fn accepts_known_adversarial_review_keys() {
+        // given
+        let source = r#"{"adversarialReview": {"enabled": true, "model": "deepseek/deepseek-v4-pro", "contextMaxTokens": 25000, "contextThresholdTokens": 3000, "timeoutSecs": 180}}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn flags_unknown_key_under_adversarial_review() {
+        // given
+        let source = r#"{"adversarialReview": {"contextMaxTokens": 25000, "bogusKey": 1}}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert!(result.errors.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "adversarialReview.bogusKey");
+        assert!(matches!(
+            result.warnings[0].kind,
+            DiagnosticKind::UnknownKey { .. }
+        ));
+    }
+
+    #[test]
+    fn detects_wrong_type_under_adversarial_review() {
+        // given: contextMaxTokens must be a number
+        let source = r#"{"adversarialReview": {"contextMaxTokens": "lots"}}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].field, "adversarialReview.contextMaxTokens");
     }
 
     #[test]

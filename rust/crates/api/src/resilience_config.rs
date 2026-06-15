@@ -76,6 +76,9 @@ pub struct ResilienceConfig {
 
 impl ResilienceConfig {
     /// Create the default resilience configuration.
+    // Inherent `default()` is intentional and pre-existing public API; an
+    // explicit allow keeps it without globally disabling the lint.
+    #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn default() -> Self {
         Self {
