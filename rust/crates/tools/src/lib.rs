@@ -4084,7 +4084,7 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "deepseek/deepseek-v4-pro";
+const DEFAULT_AGENT_MODEL: &str = "deepseek/deepseek-v4-pro:nitro";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -6851,8 +6851,10 @@ pub mod pdf_extract;
 mod subagent_mcp;
 
 pub use subagent_mcp::{
-    apply_provider_env, handle_subagent_mcp_call, list_presets, list_presets_tool_spec,
-    read_openrouter_key, run_subagent, run_subagent_tool_spec, PresetInfo, ProviderEnvGuard,
+    apply_provider_env, get_subagent, get_subagent_tool_spec, handle_subagent_mcp_call,
+    list_presets, list_presets_tool_spec, read_openrouter_key, run_subagent,
+    run_subagent_tool_spec, run_subagent_worker_from_file, start_subagent,
+    start_subagent_tool_spec, stop_subagent, stop_subagent_tool_spec, PresetInfo, ProviderEnvGuard,
     RunSubagentInput, RunSubagentOutput,
 };
 

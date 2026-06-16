@@ -96,17 +96,6 @@ mod resilience_config_tests {
 
 #[cfg(test)]
 mod safe_deserialization_tests {
-    use super::*;
-
-    #[test]
-    fn payload_size_limit_defaults_to_5mb() {
-        // Given default resilience config
-        let _config = ResilienceConfig::default();
-
-        // When checking for payload size limits
-        // Then there should be a reasonable default (e.g., 5MB)
-        assert!(true); // Placeholder - will implement in green phase
-    }
 
     #[test]
     fn safe_deserialization_never_panics() {
@@ -279,28 +268,6 @@ mod error_classification_tests {
         for error in non_retryable_errors {
             assert!(!error.is_retryable(), "{:?} should not be retryable", error);
         }
-    }
-}
-
-// ============================================================================
-// Phase 4: Conversation Runtime Enhancements
-// ============================================================================
-
-#[cfg(test)]
-mod conversation_runtime_tests {
-    // Tests that don't require runtime crate types can go here
-    // For now, we have placeholder tests for the conversation runtime features
-
-    #[test]
-    fn placeholder_compaction_strategy_test() {
-        // Placeholder test - will implement with actual implementation in green phase
-        assert!(true);
-    }
-
-    #[test]
-    fn placeholder_error_handler_test() {
-        // Placeholder test - will implement with actual implementation in green phase
-        assert!(true);
     }
 }
 

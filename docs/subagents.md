@@ -10,7 +10,7 @@ prompt; it runs in its own context with a restricted toolset, does the work, and
 returns a structured result. It is not a long-lived conversational agent — one
 prompt in, one result out.
 
-Subagents are exposed through the `run_subagent` MCP tool, served by:
+Subagents are exposed through the curated MCP tools served by:
 
 ```bash
 claw mcp serve --subagents
@@ -37,7 +37,7 @@ A run returns a structured JSON object:
 {
   "status": "completed",
   "provider": "openrouter",
-  "model": "deepseek/deepseek-v4-pro",
+  "model": "deepseek/deepseek-v4-pro:nitro",
   "repo_dir": "/path/to/repo",
   "summary": "...the subagent's output...",
   "truncated": false,
@@ -61,7 +61,8 @@ a subagent cannot wander outside its working directory.
 
 ### a. The MCP tool
 
-Call `mcp__claw-subagents__run_subagent` with:
+Call `mcp__claw-subagents__run_subagent` for a synchronous result, or
+`mcp__claw-subagents__start_subagent` for a pollable background run, with:
 
 | field              | required | notes                                              |
 |--------------------|----------|----------------------------------------------------|
@@ -72,9 +73,14 @@ Call `mcp__claw-subagents__run_subagent` with:
 | `permission_mode`  | no       | `read-only`, `workspace-write`, `danger-full-access` |
 | `repo_dir`         | no       | defaults to the server cwd                         |
 | `max_output_chars` | no       | truncates the returned summary                     |
-| `timeout_secs`     | no       | wall-clock bound                                   |
+| `timeout_secs`     | no       | optional wall-clock bound; omit for long reviews   |
 | `isolated`         | no       | run in a throwaway git worktree (see below)        |
 | `preset`           | only if `isolated` | preset name to launch                     |
+| `review_depth`     | no       | `quick`, `standard`, `deep`, or `exhaustive`       |
+| `focus`            | no       | comma-separated review focus areas                 |
+| `artifact_scope`   | no       | `diff_only`, `diff_plus_tests`, or `full_repo_context` |
+| `stop_on_first_blocker` | no  | ask a reviewer to stop after one concrete blocker  |
+| `require_evidence` | no       | ask a reviewer to cite concrete evidence           |
 
 ```json
 {
@@ -82,6 +88,25 @@ Call `mcp__claw-subagents__run_subagent` with:
   "subagent_type": "Explore",
   "permission_mode": "read-only"
 }
+```
+
+`start_subagent` returns immediately with a `run_id`, `status_file`, CLI-ready
+`status_command` and `stop_command`, plus worker `pid`. Poll with
+`mcp__claw-subagents__get_subagent`:
+
+```json
+{ "run_id": "subagent-123", "activity_limit": 20, "event_limit": 20, "stale_after_secs": 300 }
+```
+
+The status record includes the current `status`, final `summary` when complete,
+`phase`, `pid`, best-effort `worker_alive` while active, `stale`,
+`stale_reason`, JSONL `events`, `activity` tool events, and observed
+`read_paths`, `grep_patterns`, and `web_queries`. Omit `timeout_secs` for work
+that should keep running until the agent completes. If a run is stale and you
+decide it is truly frozen, call `mcp__claw-subagents__stop_subagent` or:
+
+```bash
+claw subagent stop "$run_id"
 ```
 
 > **`isolated: true` requires a `preset`.** Without one it now **fails fast** with
@@ -107,19 +132,37 @@ output contract: `task_id=<uuid>` followed by three bare file paths
 
 ### c. The CLI
 
+Synchronous:
+
 ```bash
 claw subagent run \
   --provider openrouter \
   --permission-mode read-only \
   --subagent-type Explore \
-  --model deepseek/deepseek-v4-pro \
+  --model deepseek/deepseek-v4-pro:nitro \
   --repo-dir . \
-  --timeout-secs 180 \
   --max-output-chars 8000
 ```
 
-The prompt is read from stdin. This is exactly the path the adversarial-review
-hook driver uses (`scripts/adversarial_review.sh`).
+Pollable:
+
+```bash
+run_id=$(
+  claw subagent start \
+    --provider openrouter \
+    --permission-mode read-only \
+    --subagent-type Explore \
+    --model deepseek/deepseek-v4-pro:nitro \
+    --repo-dir . \
+    --prompt "Read README.md and summarize the first heading" |
+  jq -r .run_id
+)
+claw subagent status "$run_id" --activity-limit 20
+```
+
+The prompt can also be read from stdin. The adversarial-review hook driver uses
+the pollable path (`scripts/adversarial_review.sh`) so long reviews can expose
+progress and stale state without a default wall-clock cap.
 
 ### Listing presets
 
@@ -140,7 +183,7 @@ template itself is **not** listed as a usable preset). Its fields:
 | `preset_name`     | unique id; how you select the subagent (`preset`, `--agent`)       |
 | `description`     | one-line summary of what it is for                                 |
 | `provider`        | `openrouter \| local \| lmstudio \| ollama \| anthropic \| openai \| auto` |
-| `model`           | provider model id (e.g. `deepseek/deepseek-v4-pro`)                |
+| `model`           | provider model id (e.g. `deepseek/deepseek-v4-pro:nitro`)                |
 | `resource`        | broker hint: `remote \| gpu \| cpu \| gpu+cpu` (local-first scheduling) |
 | `env`             | extra environment (e.g. `OPENAI_BASE_URL`, `OPENROUTER_API_KEY`)   |
 | `system_prompt`   | the subagent's role/instructions; keep it self-contained          |
@@ -180,8 +223,9 @@ Created subagent preset: .../scripts/presets/doc-summarizer.json
 
 Next steps:
   1. Edit .../scripts/presets/doc-summarizer.json — set system_prompt, model, provider, and allowed_tools.
-  2. Run it via the run_subagent MCP tool:
+  2. Run it via the subagent MCP tools:
        {"isolated": true, "preset": "doc-summarizer", "prompt": "<your task>"}
+     Use start_subagent + get_subagent instead when you need pollable status.
      or the launcher:
        scripts/launchers/run-claw-code.sh --agent doc-summarizer --dir . --plan "<your task>"
 ```
@@ -197,7 +241,7 @@ hunting for incorrect or inert logic, missing edge cases, false-green or
 placeholder tests, security regressions, and silent scope/plan deviations. It
 **cannot modify the workspace**.
 
-It runs automatically through two hooks in `.claude/settings.json`, both driven
+It runs automatically through two hooks in `.codex/hooks.json`, both driven
 by `scripts/adversarial_review.sh`:
 
 ```json
@@ -206,12 +250,12 @@ by `scripts/adversarial_review.sh`:
     "PostToolUse": [
       { "matcher": "ExitPlanMode",
         "hooks": [{ "type": "command",
-          "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/adversarial_review.sh\" --mode plan" }] }
+          "command": "bash \"${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/adversarial_review.sh\" --mode plan" }] }
     ],
     "Stop": [
       { "matcher": "",
         "hooks": [{ "type": "command",
-          "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/adversarial_review.sh\" --mode implementation" }] }
+          "command": "bash \"${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/adversarial_review.sh\" --mode implementation" }] }
     ]
   }
 }
@@ -221,6 +265,29 @@ by `scripts/adversarial_review.sh`:
 - `Stop` → reviews the **diff** (`git diff` + `git diff --staged`).
 
 You can also run it on demand via the `/adversarial-review` skill.
+
+**Installing the skill globally (user-level).** The skill ships project-scoped in
+`.agents/skills/adversarial-review/`. To make it available in every project on the
+machine, copy both files to the user-level skills directory (the skill reads
+`rubric.md` by path, so both must travel together):
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/adversarial-review"
+cp .agents/skills/adversarial-review/{SKILL.md,rubric.md} "${CODEX_HOME:-$HOME/.codex}/skills/adversarial-review/"
+```
+
+The on-demand skill (MCP `run_subagent`, or `start_subagent` + `get_subagent` for
+long reviews) and the headless `claw subagent run` / `claw subagent start` paths
+only require the `claw` binary on `PATH` and `OPENROUTER_API_KEY` in the environment.
+The automatic `Stop` / `PostToolUse(ExitPlanMode)` hooks remain project-scoped — they
+run `scripts/adversarial_review.sh` from the repo that defines them.
+
+> **`claw doctor` caveat:** the **Auth** check only looks at `ANTHROPIC_API_KEY` /
+> `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` — not `OPENROUTER_API_KEY` or the
+> `provider.apiKey` in `~/.claw/settings.json`. With OpenRouter it shows a harmless
+> "no supported auth env vars were found" warning (0 failures); verify auth with a
+> real call: `echo "ping" | claw subagent run --provider openrouter --permission-mode
+> read-only --subagent-type Explore` should return `status: "completed"`.
 
 If the reviewer returns `VERDICT: BLOCK`, the hook emits
 `{"decision":"block", ...}` and **completion is blocked** until the findings are
@@ -232,15 +299,17 @@ the reviewer needs the user's intent to judge scope/plan deviations. Long
 conversations are summarized first via a single OpenRouter call; short ones are
 passed through (lightly trimmed).
 
-**It fails open, loudly.** If `OPENROUTER_API_KEY` is unset (or the claw binary
-is missing, or the reviewer times out), the review is *skipped* with a visible
-banner and a `systemMessage` — never silently treated as a clean pass, and never
-a hard block.
+**It fails open, loudly.** If `OPENROUTER_API_KEY` is unset, the claw binary is
+missing, or an explicitly configured reviewer timeout fires, the review is
+*skipped* with a visible banner and a `systemMessage` — never silently treated
+as a clean pass, and never a hard block. By default the reviewer has no timeout;
+the hook polls `claw subagent status`, prints phase/liveness/stale updates, and
+prints the `claw subagent stop` command when a run looks stale.
 
 ## 6. Configuring the reviewer via claw-code settings
 
 You can tune the reviewer **without env vars** by adding an `adversarialReview`
-object to `.claude/settings.json` (shared) or `.claude/settings.local.json`
+object to `.codex/settings.json` (shared) or `.codex/settings.local.json`
 (machine-local override — it wins over the shared file).
 
 Keys (validated by the config schema):
@@ -249,7 +318,14 @@ Keys (validated by the config schema):
 |--------------------------|--------|-------------------------------------------------------------------------|
 | `enabled`                | bool   | set `false` to skip the review entirely                                 |
 | `model`                  | string | reviewer model                                                          |
-| `timeoutSecs`            | number | reviewer wall-clock bound                                               |
+| `timeoutSecs`            | number | optional reviewer wall-clock bound; omit for no review timeout          |
+| `staleAfterSecs`         | number | seconds without activity before polling reports stale                   |
+| `pollSecs`               | number | seconds between hook status polls                                       |
+| `reviewDepth`            | string | `quick`, `standard`, `deep`, or `exhaustive`                            |
+| `focus`                  | string | comma-separated review focus areas                                      |
+| `artifactScope`          | string | `diff_only`, `diff_plus_tests`, or `full_repo_context`                  |
+| `stopOnFirstBlocker`     | bool   | ask reviewer to stop after one concrete blocker                         |
+| `requireEvidence`        | bool   | ask reviewer to cite concrete evidence                                  |
 | `contextMaxTokens`       | number | **token** cap on the conversation context summarized + sent (driver converts at ~4 chars/token; default 25000 tokens ≈ 100000 chars) |
 | `contextThresholdTokens` | number | token count above which the conversation is summarized rather than sent raw |
 | `contextModel`           | string | model used for the summary                                              |
@@ -263,7 +339,14 @@ Matching env overrides:
 |---------------------------------|------------------------------------------------------|
 | `CLAW_REVIEW_MODEL`             | reviewer model                                       |
 | `CLAW_SUBAGENT_MODEL`           | reviewer model (fallback)                            |
-| `CLAW_REVIEW_TIMEOUT`           | reviewer timeout (secs)                              |
+| `CLAW_REVIEW_TIMEOUT`           | optional reviewer timeout (secs)                     |
+| `CLAW_REVIEW_STALE_AFTER`       | stale threshold (secs)                               |
+| `CLAW_REVIEW_POLL_SECS`         | poll interval (secs)                                 |
+| `CLAW_REVIEW_DEPTH`             | review depth                                         |
+| `CLAW_REVIEW_FOCUS`             | review focus areas                                   |
+| `CLAW_REVIEW_ARTIFACT_SCOPE`    | review artifact scope                                |
+| `CLAW_REVIEW_STOP_ON_FIRST_BLOCKER` | stop-on-first-blocker hint                       |
+| `CLAW_REVIEW_REQUIRE_EVIDENCE`  | evidence-required hint                               |
 | `CLAW_REVIEW_CONTEXT_MODEL`     | summary model                                        |
 | `CLAW_REVIEW_CONTEXT_THRESHOLD` | summarize threshold, in **chars**                    |
 | `CLAW_REVIEW_CONTEXT_TIMEOUT`   | summary call timeout (secs)                          |
@@ -274,35 +357,44 @@ Matching env overrides:
 > `CLAW_REVIEW_CONTEXT_*` **env** overrides are in *chars*. The driver converts
 > token-based settings at ~4 chars/token.
 
-Complete example `.claude/settings.json` snippet:
+Complete example `.codex/settings.json` snippet:
 
 ```json
 {
   "permissions": {
     "allow": [
       "mcp__claw-subagents__run_subagent",
+      "mcp__claw-subagents__start_subagent",
+      "mcp__claw-subagents__get_subagent",
+      "mcp__claw-subagents__stop_subagent",
       "mcp__claw-subagents__list_presets"
     ]
   },
   "adversarialReview": {
     "enabled": true,
-    "model": "deepseek/deepseek-v4-pro",
-    "timeoutSecs": 180,
+    "model": "deepseek/deepseek-v4-pro:nitro",
+    "staleAfterSecs": 300,
+    "pollSecs": 15,
+    "reviewDepth": "deep",
+    "focus": "correctness,tests,security,scope",
+    "artifactScope": "diff_plus_tests",
+    "stopOnFirstBlocker": false,
+    "requireEvidence": true,
     "contextMaxTokens": 25000,
     "contextThresholdTokens": 3000,
-    "contextModel": "deepseek/deepseek-v4-pro",
+    "contextModel": "deepseek/deepseek-v4-pro:nitro",
     "contextTimeoutSecs": 60
   },
   "hooks": {
     "PostToolUse": [
       { "matcher": "ExitPlanMode",
         "hooks": [{ "type": "command",
-          "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/adversarial_review.sh\" --mode plan" }] }
+          "command": "bash \"${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/adversarial_review.sh\" --mode plan" }] }
     ],
     "Stop": [
       { "matcher": "",
         "hooks": [{ "type": "command",
-          "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/adversarial_review.sh\" --mode implementation" }] }
+          "command": "bash \"${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/adversarial_review.sh\" --mode implementation" }] }
     ]
   }
 }
@@ -324,10 +416,10 @@ focused system prompt:
   "preset_name": "security-reviewer",
   "description": "Read-only security reviewer for the current diff.",
   "provider": "openrouter",
-  "model": "deepseek/deepseek-v4-pro",
+  "model": "deepseek/deepseek-v4-pro:nitro",
   "resource": "remote",
   "env": {
-    "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
+    "OPENAI_BASE_URL": "https://openrouter.ai/api/v1/chat/completions",
     "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
   },
   "system_prompt": "You are a read-only application-security reviewer. Given a diff, hunt only for security regressions: injection, path traversal, SSRF, secret leakage, auth/permission bypass, unsafe deserialization, and missing input validation on untrusted data. Cite file:line for every finding and propose a one-line fix. End with exactly one of 'VERDICT: BLOCK' (numbered blocking issues) or 'VERDICT: PASS' (one-line rationale).",

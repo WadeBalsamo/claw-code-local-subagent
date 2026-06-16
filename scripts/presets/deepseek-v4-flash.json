@@ -4,7 +4,7 @@
   "provider": "openrouter",
   "model": "deepseek/deepseek-v4-flash",
   "resource": "remote",
-  "env": {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"},
+  "env": {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"},
   "system_prompt": "You are a fast, low-cost cloud model for routine coding and review: focused implementations, small refactors, quick reviews, and short analyses. You are stateless and one-shot. Do exactly what the brief asks, cite file:line where relevant, and keep the output terse. Tokens cost money — be efficient.",
   "allowed_tools": ["read_file", "edit_file", "write_file", "grep_search", "glob_search", "bash"],
   "max_context": 131072,

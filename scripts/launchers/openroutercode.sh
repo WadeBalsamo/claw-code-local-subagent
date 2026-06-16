@@ -18,7 +18,8 @@ RECENTS_FILE="$CONFIG_DIR/recent_models"
 CACHE_FILE="$CONFIG_DIR/openrouter_models_cache.tsv"
 CACHE_TTL=$(( 60 * 60 * 6 ))
 MAX_RECENTS=5
-DEFAULT_MODEL="deepseek/deepseek-v4-pro"
+DEFAULT_MODEL="deepseek/deepseek-v4-pro:nitro"
+LEGACY_DEFAULT_MODEL="deepseek/deepseek-v4-pro"
 OPENROUTER_API="https://openrouter.ai/api/v1/models?supported_parameters=tools"
 PAGE_SIZE=18
 
@@ -58,7 +59,9 @@ save_recent() {
 
 cache_fresh() {
   [ -f "$CACHE_FILE" ] || return 1
-  local age=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) ))
+  local mtime
+  mtime="$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)"
+  local age=$(( $(date +%s) - mtime ))
   [ "$age" -lt "$CACHE_TTL" ]
 }
 
@@ -168,7 +171,10 @@ browse_tui() {
 
   while true; do
     if [ "$filters_dirty" -eq 1 ]; then
-      mapfile -t rows < <(filter_catalog "$f_prov" "$f_cat" "$f_in" "$f_ctx" "$f_term")
+      rows=()
+      while IFS= read -r row; do
+        rows+=("$row")
+      done < <(filter_catalog "$f_prov" "$f_cat" "$f_in" "$f_ctx" "$f_term")
       total="${#rows[@]}"; total_pages=$(( (total + PAGE_SIZE - 1) / PAGE_SIZE )); [ "$total_pages" -lt 1 ] && total_pages=1
       page=0; filters_dirty=0
     fi
@@ -177,7 +183,8 @@ browse_tui() {
     echo "Models: $(wc -l < "$CACHE_FILE") cached, $total match" >&2
     echo "p:$f_prov k:$f_cat \$:$f_in x:$f_ctx s:$f_term  Page $((page+1))/$total_pages" >&2
     echo "---" >&2
-    local start=$(( page * PAGE_SIZE )) end=$(( start + PAGE_SIZE ))
+    local start=$(( page * PAGE_SIZE ))
+    local end=$(( start + PAGE_SIZE ))
     [ "$end" -gt "$total" ] && end="$total"
     if [ "$total" -eq 0 ]; then echo "(no models — type 'a' to clear)" >&2
     else
@@ -230,9 +237,18 @@ SKIP_SAVE=0
 if [ -z "$MODEL" ]; then
   maybe_refresh
   SAVED=""; [ -f "$MODEL_FILE" ] && SAVED="$(cat "$MODEL_FILE")"
+  if [ "$SAVED" = "$LEGACY_DEFAULT_MODEL" ]; then
+    SAVED="$DEFAULT_MODEL"
+    printf '%s\n' "$DEFAULT_MODEL" > "$MODEL_FILE"
+  fi
   EFFECTIVE="${SAVED:-$DEFAULT_MODEL}"
   echo "default: $EFFECTIVE" >&2
-  RECENTS=(); [ -f "$RECENTS_FILE" ] && mapfile -t RECENTS < <(head -n "$MAX_RECENTS" "$RECENTS_FILE")
+  RECENTS=()
+  if [ -f "$RECENTS_FILE" ]; then
+    while IFS= read -r recent; do
+      RECENTS+=("$recent")
+    done < <(head -n "$MAX_RECENTS" "$RECENTS_FILE")
+  fi
   if [ "${#RECENTS[@]}" -gt 0 ]; then
     i=1; for m in "${RECENTS[@]}"; do printf '  %d) %s\n' "$i" "$m" >&2; i=$((i+1)); done
   fi
@@ -264,7 +280,7 @@ fi
 
 save_recent "$MODEL"
 
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1/chat/completions"
 export OPENAI_API_KEY="$OPENROUTER_API_KEY"
 export HTTP_REFERER="https://localhost"
 export X_TITLE="claw-code"

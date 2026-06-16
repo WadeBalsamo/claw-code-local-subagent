@@ -94,7 +94,10 @@ trap cleanup EXIT
 # -- model selection TUI ------------------------------------------------------
 select_model() {
   local models
-  mapfile -t models < <(get_models 2>/dev/null || true)
+  models=()
+  while IFS= read -r model; do
+    models+=("$model")
+  done < <(get_models 2>/dev/null || true)
   if [ ${#models[@]} -eq 0 ]; then
     echo "No models found. Run: ollama pull <model>" >&2; exit 1
   fi

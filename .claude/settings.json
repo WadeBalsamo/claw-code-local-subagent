@@ -2,6 +2,9 @@
   "permissions": {
     "allow": [
       "mcp__claw-subagents__run_subagent",
+      "mcp__claw-subagents__start_subagent",
+      "mcp__claw-subagents__get_subagent",
+      "mcp__claw-subagents__stop_subagent",
       "mcp__claw-subagents__list_presets"
     ]
   },

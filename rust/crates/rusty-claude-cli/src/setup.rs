@@ -898,7 +898,7 @@ fn setup_openrouter(
     set_env(
         &mut env_map,
         "OPENAI_BASE_URL",
-        "https://openrouter.ai/api/v1".to_string(),
+        "https://openrouter.ai/api/v1/chat/completions".to_string(),
     );
     set_env(&mut env_map, "OPENAI_API_KEY", api_key.clone());
     set_env(
@@ -1031,7 +1031,7 @@ fn resolve_model_provider(
             let key = load_openrouter_api_key()
                 .unwrap_or_else(|_| env::var("OPENAI_API_KEY").unwrap_or_default());
             (
-                "https://openrouter.ai/api/v1".to_string(),
+                "https://openrouter.ai/api/v1/chat/completions".to_string(),
                 key,
                 "none".to_string(),
                 "OpenRouter".to_string(),

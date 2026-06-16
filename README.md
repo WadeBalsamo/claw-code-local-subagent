@@ -21,26 +21,36 @@ Everything else — improved compaction, stream debugging, the named-resource sc
 
 ---
 
-## Set it up as a Claude Code sub-agent (start here)
+## Set it up as a Codex sub-agent (start here)
 
-claw-code plugs into **Claude Code** as a sub-agent over MCP: Claude Code stays the
-orchestrator and calls one tool — `run_subagent` — to hand bulk coding to a **local model**
-(LM Studio / Ollama) or a cheap **OpenRouter** model, and gets back a bounded result (status
-+ summary + diff stat), never the sub-agent's transcript. `claw mcp serve --subagents` is the stdio MCP
-server that exposes `run_subagent` and `list_presets`.
+claw-code plugs into **Codex** as a sub-agent over MCP: Codex stays the
+orchestrator and calls `run_subagent` for a synchronous result, or `start_subagent` +
+`get_subagent` for a long pollable run, to hand bulk coding to a **local model**
+(LM Studio / Ollama) or a cheap **OpenRouter** model. It gets back bounded artifacts
+(status, summary, diff stat, observed tool activity, and read paths), never the
+sub-agent's transcript. `claw mcp serve --subagents` is the stdio MCP server that
+exposes those sub-agent tools plus `list_presets`.
 
 ### 1. Build & install
 
 ```bash
 git clone https://github.com/wadebalsamo/claw-code-local-subagent.git
 cd claw-code-local-subagent
-./install.sh                 # builds `claw`, installs launchers into ~/.local/bin
+./install.sh --release       # builds `claw`, installs launchers into ~/.local/bin
 claw --version               # confirm (ensure ~/.local/bin is on your PATH)
+claw doctor                  # local health report (auth/config/MCP/workspace)
 ```
 
-### 2. Register the server in your `.claude/` config
+`./install.sh` defaults to a fast **debug** build; pass `--release` for an optimized binary
+(the `subagent_mcp` bridge is a default cargo feature, so no extra flags are needed). The
+installer writes `claw` plus the `lmcode` / `ollamacode` / `openroutercode` / `run-claw-code`
+shims into `~/.local/bin`.
 
-Pick one. The tool Claude Code will expose is `mcp__claw-subagents__run_subagent`.
+### 2. Register the server in your Codex config
+
+Pick one. Codex will expose `mcp__claw-subagents__run_subagent` for synchronous
+calls, `mcp__claw-subagents__start_subagent` / `mcp__claw-subagents__get_subagent`
+for pollable calls, and `mcp__claw-subagents__stop_subagent` for cancellation.
 
 **Project-scoped (committed, shared with the repo)** — create **`.mcp.json`** at the repo root:
 
@@ -57,8 +67,9 @@ Pick one. The tool Claude Code will expose is `mcp__claw-subagents__run_subagent
 }
 ```
 
-(Drop the `env` block if you only use a local backend.) Or let the CLI write it — `--scope
-project` writes `.mcp.json`; `--scope user` writes your global `~/.claude.json`:
+(Drop the `env` block if you only use a local backend.) Claude Code can also write an
+MCP config for compatibility — `--scope project` writes `.mcp.json`; `--scope user`
+writes your global `~/.claude.json`:
 
 ```bash
 claude mcp add --scope project claw-subagents --env OPENROUTER_API_KEY=sk-or-... -- claw mcp serve --subagents
@@ -66,62 +77,108 @@ claude mcp add --scope project claw-subagents --env OPENROUTER_API_KEY=sk-or-...
 
 ### 3. Auto-approve the tools (skip the per-call prompt)
 
-Add to **`.claude/settings.json`** (project) or `~/.claude/settings.json` (user):
+For Claude Code compatibility, add to **`.claude/settings.json`** (project) or
+`~/.claude/settings.json` (user):
 
 ```json
 {
   "permissions": {
     "allow": [
       "mcp__claw-subagents__run_subagent",
+      "mcp__claw-subagents__start_subagent",
+      "mcp__claw-subagents__get_subagent",
+      "mcp__claw-subagents__stop_subagent",
       "mcp__claw-subagents__list_presets"
     ]
   }
 }
 ```
 
-A project `.mcp.json` server is also approved once on first launch. Run `/mcp` inside Claude
-Code to confirm `claw-subagents` is connected and exposes `run_subagent` + `list_presets`.
+A project `.mcp.json` server is also approved once on first launch. Run `/mcp` inside Codex
+or Claude Code to confirm `claw-subagents` is connected and exposes `run_subagent`, `start_subagent`,
+`get_subagent`, `stop_subagent`, and `list_presets`.
 
 ### 4. Point the sub-agent at a model & delegate
 
 - **OpenRouter (default):** set `OPENROUTER_API_KEY` (step 2). The default sub-agent model is
-  `deepseek/deepseek-v4-pro`; override per call with `model`, or globally with
+  `deepseek/deepseek-v4-pro:nitro` (OpenRouter's throughput-optimized route); override per call with `model`, or globally with
   `CLAW_SUBAGENT_MODEL`.
 - **Local:** run LM Studio (`localhost:1234`) with a **tool-capable** model — the recommended
   local default is **NVIDIA Nemotron-3-Super 120B** (`nemotron-3-super-120b-a12b`) — and pass
   `provider: "lmstudio"` + the loaded `model` (or just use the `nemotron-3-super-120b` preset).
   Ollama works too (`localhost:11434`, `provider: "ollama"`).
 
-Ask Claude Code to delegate, or it calls `mcp__claw-subagents__run_subagent` directly — only
-`prompt` is required:
+Ask Codex to delegate, or it calls `mcp__claw-subagents__run_subagent` directly for
+a quick synchronous result — only `prompt` is required:
 
 ```json
 { "prompt": "Add input validation to src/api/users.rs and a unit test", "repo_dir": "/abs/path/to/repo" }
 ```
 
+For long or recursive work, call `mcp__claw-subagents__start_subagent` with the same input
+and poll `mcp__claw-subagents__get_subagent` using the returned `run_id` or `status_file`.
+The headless CLI returns `status_command` and `stop_command`, ready-to-run commands using the
+absolute status file:
+
+```json
+{ "run_id": "subagent-123", "activity_limit": 20 }
+```
+
 The **Setup reference** below expands this: choosing/verifying a backend, the in-process vs
 `isolated` execution modes, and GPU resource tips.
 
+### 5. (Optional) Persist a default provider
+
+The MCP/headless paths above already work from `OPENROUTER_API_KEY` in the environment. To make a
+provider the **durable default** for the interactive `claw` REPL too, persist it to
+`~/.claw/settings.json` (written `0600`):
+
+```bash
+claw setup                   # interactive wizard: detect providers, pick a model, persist the choice
+```
+
+The wizard writes a `provider` block — for OpenRouter that is `{"kind":"openai","apiKey":"sk-or-…",
+"baseUrl":"https://openrouter.ai/api/v1/chat/completions"}` plus a top-level `"model"`. For a **non-interactive**
+setup (CI, scripts), write that JSON directly rather than using the wizard. Note the
+`claw setup openrouter [model]` *shortcut* configures the provider and immediately **launches a
+session** with it — it does not persist `~/.claw/settings.json`; only the bare `claw setup` wizard
+persists.
+
+> **`claw doctor` caveat:** the **Auth** check only inspects `ANTHROPIC_API_KEY` /
+> `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`. It does **not** recognize `OPENROUTER_API_KEY` or the
+> `provider.apiKey` persisted in `~/.claw/settings.json`, so it reports a harmless
+> "no supported auth env vars were found" **warning** even when OpenRouter is configured correctly.
+> Confirm the provider with a real call instead — e.g. the `claw subagent run … --provider openrouter`
+> command shown below returns `status: "completed"` when auth is working.
+
 ---
 
-## Use it as an adversarial reviewer with Claude Code as master
+## Use it as an adversarial reviewer with Codex as master
 
-When Claude Code drives the work, this fork can give it an independent, **read-only** second
+When Codex drives the work, this fork can give it an independent, **read-only** second
 opinion on **every plan and every implementation** — a separate, disinterested model that
 re-derives the critique from the raw plan/diff and hunts for inert logic, missing edge cases,
 false-green tests, security regressions, and silent scope creep. This repo ships that wiring:
 
-- **Skill** — `.claude/skills/adversarial-review/SKILL.md` defines the review rubric and tells
-  Claude Code how to call `mcp__claw-subagents__run_subagent` with a read-only `Explore` sub-agent
-  and how to act on the structured verdict. Invoke it on demand for a deeper review.
-- **Hook (enforcement)** — `.claude/settings.json` registers two Claude Code hooks that run
+- **Skill** — `.agents/skills/adversarial-review/SKILL.md` defines the review rubric and tells
+  Codex how to call `mcp__claw-subagents__run_subagent` for a quick read-only review, or
+  `start_subagent` + `get_subagent` for a long pollable read-only review, and how to act on the
+  structured verdict. Invoke it on demand for a deeper review. It ships
+  project-scoped here; to make it available in **every** project, install it user-level by copying
+  `SKILL.md` **and** `rubric.md` to `${CODEX_HOME:-~/.codex}/skills/adversarial-review/`
+  (`mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/adversarial-review" && cp .agents/skills/adversarial-review/{SKILL.md,rubric.md} "${CODEX_HOME:-$HOME/.codex}/skills/adversarial-review/"`).
+  The automatic hooks below stay project-scoped (they run `scripts/adversarial_review.sh` from this repo).
+- **Hook (enforcement)** — `.codex/hooks.json` registers two Codex hooks that run
   `scripts/adversarial_review.sh`: a `PostToolUse` hook on `ExitPlanMode` reviews the **plan**, and
   a `Stop` hook reviews the **implementation** diff. A `VERDICT: BLOCK` becomes a hook
-  `block` decision, so Claude must address the findings before finishing. The driver **fails open**
-  (a missing key, offline reviewer, or timeout skips the review rather than wedging the session).
-- **Headless reviewer** — `claw subagent run` runs the same curated `run_subagent` surface from a
+  `block` decision, so Codex must address the findings before finishing. The driver **fails open**
+  (a missing key, offline reviewer, or explicit timeout skips the review rather than wedging the session).
+  By default it uses `claw subagent start` + `status`, prints poll/stale updates, and has no review
+  timeout unless configured.
+- **Headless reviewer** — `claw subagent run` runs the same curated synchronous surface from a
   shell and prints the structured `RunSubagentOutput` JSON, so the hook (or any master) gets the
-  same machine-readable `status`/`summary`/`diff_stat` contract as the MCP tool:
+  same machine-readable `status`/`summary`/`diff_stat` contract as the MCP tool. For a long manual
+  review, use `claw subagent start` and poll with `claw subagent status`:
 
   ```bash
   echo "Review this diff: $(git diff)" | claw subagent run \
@@ -131,7 +188,7 @@ false-green tests, security regressions, and silent scope creep. This repo ships
 **Read-only is enforced**: `permission_mode: read-only` + `subagent_type: Explore` give the
 reviewer only read/search/web tools — it cannot edit, write, or mutate the workspace (a non-empty
 `diff_stat` would flag a violation). **The model is configurable**: the default is
-`deepseek/deepseek-v4-pro`; set `CLAW_REVIEW_MODEL` (or `CLAW_SUBAGENT_MODEL`) to repoint the
+`deepseek/deepseek-v4-pro:nitro` (OpenRouter's throughput-optimized route); set `CLAW_REVIEW_MODEL` (or `CLAW_SUBAGENT_MODEL`) to repoint the
 reviewer at any OpenRouter model without editing the skill or hook. The reviewer is also available
 as the `adversarial-review` preset (`claw mcp` → `list_presets`).
 
@@ -301,7 +358,7 @@ The `claw setup` subcommand configures and launches provider-specific sessions:
 **`claw setup openrouter [model]`**
 - Manages API key in `~/.config/openroutercode/.env` (falls back to the legacy `~/.config/opencode/.env` for existing users)
 - Fetches the tool-capable model catalog from OpenRouter
-- Sets `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, `CLAW_RESILIENCE=none`
+- Sets `OPENAI_BASE_URL=https://openrouter.ai/api/v1/chat/completions`, `CLAW_RESILIENCE=none`
 - Launches claw with the selected model
 
 ### Ollama and OpenRouter Launchers
@@ -327,9 +384,9 @@ two execution modes.
 
 ### The mental model
 
-Claude Code (running Sonnet) stays the **orchestrator**. claw-code becomes a cheap, sandboxed **sub-agent** it calls through a single MCP tool — `run_subagent` — to offload bulk coding work to a **local model** or an **OpenRouter model** (DeepSeek by default). You delegate to save Sonnet tokens and/or to run fully local, and you get back a **bounded result** (status + summary + diff stat), never the sub-agent's transcript.
+Claude Code (running Sonnet) stays the **orchestrator**. claw-code becomes a cheap, sandboxed **sub-agent** it calls through a small MCP surface — `run_subagent` for synchronous results, or `start_subagent` + `get_subagent` for pollable long runs — to offload bulk coding work to a **local model** or an **OpenRouter model** (DeepSeek by default). You delegate to save Sonnet tokens and/or to run fully local, and you get back **bounded artifacts** (status, summary, diff stat, activity, read paths), never the sub-agent's transcript.
 
-`claw mcp serve --subagents` is the bridge: a stdio MCP server that exposes exactly two tools — `run_subagent` and `list_presets`.
+`claw mcp serve --subagents` is the bridge: a stdio MCP server that exposes exactly five tools — `run_subagent`, `start_subagent`, `get_subagent`, `stop_subagent`, and `list_presets`.
 
 ### Step 1 — Install
 
@@ -355,7 +412,7 @@ Point the sub-agent at OpenRouter (simplest) or a local server. You can configur
 2. Store it (either works):
    - `claw setup openrouter` — interactive; saves the key to `~/.config/openroutercode/.env`, **or**
    - export it for the session: `export OPENROUTER_API_KEY=sk-or-...`
-3. The default sub-agent model is `deepseek/deepseek-v4-pro` — the strong, tool-capable default. Use `deepseek/deepseek-v4-flash` for a cheaper/faster option, or any tool-capable OpenRouter model. Override globally with `CLAW_SUBAGENT_MODEL`, or per call with the `model` field.
+3. The default sub-agent model is `deepseek/deepseek-v4-pro:nitro` — the strong, tool-capable default using OpenRouter's throughput-optimized route. Use `deepseek/deepseek-v4-flash` for a cheaper/faster option, or any tool-capable OpenRouter model. Override globally with `CLAW_SUBAGENT_MODEL`, or per call with the `model` field.
 
 #### Option B — Local: Ollama
 
@@ -418,13 +475,14 @@ claude mcp add claw-subagents -- claw mcp serve --subagents
 }
 ```
 
-Confirm inside Claude Code with `/mcp` — you should see `claw-subagents` exposing `run_subagent` and `list_presets`.
+Confirm inside Claude Code with `/mcp` — you should see `claw-subagents` exposing `run_subagent`, `start_subagent`, `get_subagent`, `stop_subagent`, and `list_presets`.
 
-**How the env flows:** Claude Code launches `claw mcp serve --subagents` as a child process and injects the `--env` (or `.mcp.json` `env`) values into it. Inside, `run_subagent` reads `OPENROUTER_API_KEY` (or the `~/.config/openroutercode/.env` → `~/.config/opencode/.env` fallback) for OpenRouter; for local providers it sets the localhost base URL itself.
+**How the env flows:** Claude Code launches `claw mcp serve --subagents` as a child process and injects the `--env` (or `.mcp.json` `env`) values into it. Inside, the sub-agent tools read `OPENROUTER_API_KEY` (or the `~/.config/openroutercode/.env` → `~/.config/opencode/.env` fallback) for OpenRouter; for local providers they set the localhost base URL themselves.
 
 ### Step 5 — Delegate work to the sub-agent from Claude Code
 
-Ask Claude Code to use the tool, or it calls `mcp__claw-subagents__run_subagent` directly. The only required field is `prompt`.
+Ask Claude Code to use the tool, or it calls `mcp__claw-subagents__run_subagent` directly
+for a synchronous result. The only required field is `prompt`.
 
 **OpenRouter (uses the DeepSeek default):**
 ```json
@@ -445,7 +503,9 @@ Ask Claude Code to use the tool, or it calls `mcp__claw-subagents__run_subagent`
 }
 ```
 
-Full input: `prompt` (required) plus optional `provider` (`local|openrouter|ollama|lmstudio|anthropic|openai|auto`), `model`, `repo_dir`, `subagent_type`, `permission_mode` (`read-only|workspace-write|danger-full-access`), `isolated`, `timeout_secs`, `max_output_chars`. The tool returns compact JSON — `status` (`completed|failed|timeout`), `summary`, `diff_stat`, `model`, `duration_ms` — and **never** the sub-agent's transcript. Failures and timeouts are encoded in `status`/`error`, not raised as transport errors. Claude Code reads the summary + diff stat, inspects the changed files in `repo_dir`, and decides what to keep.
+Full input: `prompt` (required) plus optional `provider` (`local|openrouter|ollama|lmstudio|anthropic|openai|auto`), `model`, `repo_dir`, `subagent_type`, `permission_mode` (`read-only|workspace-write|danger-full-access`), `isolated`, `timeout_secs`, `max_output_chars`, and review hints (`review_depth`, `focus`, `artifact_scope`, `stop_on_first_blocker`, `require_evidence`). `run_subagent` returns compact JSON — `status` (`completed|failed|timeout`), `summary`, `diff_stat`, `model`, `duration_ms` — and **never** the sub-agent's transcript. Failures and timeouts are encoded in `status`/`error`, not raised as transport errors. Claude Code reads the summary + diff stat, inspects the changed files in `repo_dir`, and decides what to keep.
+
+For work that may take a while, call `start_subagent` with the same input instead. It returns immediately with `run_id`, `status_file`, `status_command`, `stop_command`, and `pid`; poll `get_subagent` with the `run_id` or `status_file`. The status record includes `status`, `phase`, `summary` when complete, `pid`, best-effort `worker_alive` while active, `stale`, `events`, `activity` tool events, `read_paths`, `grep_patterns`, and `web_queries`. Use `stop_subagent` or `claw subagent stop` only when the parent decides a stale run is truly frozen.
 
 Provider notes:
 - `provider: "local" | "ollama" | "lmstudio"` requires the local server running **and** an explicit `model` (there is no local default).
@@ -455,7 +515,7 @@ Provider notes:
 Discover ready-made (provider, model, system-prompt) bundles with the `list_presets` tool (sourced from `scripts/presets/` and `~/.lmcode/presets/`).
 
 **Two execution modes:**
-- **Default (in-process):** fast; the sub-agent edits files directly in `repo_dir`. The MCP server processes calls one at a time.
+- **Default (in-process):** fast; the sub-agent edits files directly in `repo_dir`. Synchronous `run_subagent` calls are processed one at a time; pollable `start_subagent` calls spawn background workers.
 - **`isolated: true` (with a `preset`):** runs through `run-claw-code` in a throwaway **git worktree** with a hard kill-on-timeout and a captured `diff.patch` — use it for long/untrusted tasks, or when you want GPU scheduling (below).
 
 ### Resource management for local GPUs
@@ -463,7 +523,7 @@ Discover ready-made (provider, model, system-prompt) bundles with the `list_pres
 Local inference is VRAM-bound, and that shapes how you run local sub-agents:
 
 - **One GPU usually holds one model.** Firing several local sub-agents at the same GPU forces the server to swap models (slow) or run out of VRAM. Plan for **one resident model per GPU**.
-- **A single Claude Code session is already serialized.** The MCP server processes `run_subagent` calls **one at a time**, so one Claude Code session won't fan out concurrent GPU hits through a given `claw mcp serve --subagents`.
+- **Synchronous MCP calls are serialized.** The MCP server processes `run_subagent` calls **one at a time**, so that path will not fan out concurrent GPU hits through a given `claw mcp serve --subagents`. `start_subagent` is different: it returns immediately and the background workers can overlap, so do not fan out local pollable starts unless you have separate resources or external scheduling.
 - **For fleets / multiple orchestrators, use the named-resource scheduler.** Concurrency across *different* agents is where GPUs collide. Tag work to a named resource and the scheduler serializes it with `flock`:
   ```bash
   run-claw-code --agent qwen3-coder-30b --dir /repo --plan "..." \
@@ -479,7 +539,7 @@ Local inference is VRAM-bound, and that shapes how you run local sub-agents:
 
 OpenClaw is the orchestration system this fork was built for. There are two ways to give it claw-code as a sub-agent; both preserve the bounded-output contract.
 
-**Mode 1 — MCP tool (interactive, single result).** If your OpenClaw agent speaks MCP, register `claw mcp serve --subagents` exactly as in Step 4 and call `run_subagent` / `list_presets`. Best when the orchestrator wants one delegated result inline and lets claw manage provider/model.
+**Mode 1 — MCP tools (interactive or pollable).** If your OpenClaw agent speaks MCP, register `claw mcp serve --subagents` exactly as in Step 4 and call `run_subagent` for an inline result, `start_subagent` + `get_subagent` for a pollable run, `stop_subagent` to cancel a run that is actually frozen, or `list_presets` for presets. Best when the orchestrator wants claw to manage provider/model while returning bounded artifacts.
 
 **Mode 2 — `run-claw-code` CLI contract (fleets, GPU scheduling, PRs).** The original design, and the better fit for many concurrent agents. OpenClaw shells out:
 ```bash
@@ -497,7 +557,7 @@ task_id=<uuid>
 ```
 This path layers on what fleet orchestration needs beyond `run_subagent`: git-worktree isolation, hard kill-on-timeout, the `flock` GPU scheduler, and optional PR creation (`--pr-into`) and sprint manifests (`--sprint-id`). The orchestrator polls `status.json`, reads `summary.md`, applies `diff.patch` — never ingesting the transcript. Presets (`scripts/presets/`, or per-user `~/.lmcode/presets/`) carry the local-first `provider`/`model`, the `tier_ref`, the broker `resource` slot, and the permission/plan modes, so the orchestrator only picks a preset and a task — and may override `--provider`/`--model` to run a budget-gated OpenRouter rung.
 
-**Which to use:** MCP `run_subagent` for interactive, one-off delegation (Claude Code, or an MCP-native OpenClaw agent); `run-claw-code` for batch/parallel fleets that need GPU scheduling and PR automation.
+**Which to use:** MCP `run_subagent` for interactive, one-off delegation; MCP `start_subagent` + `get_subagent` for long work where the parent needs status/read observability and explicit cancellation; `run-claw-code` for batch/parallel fleets that need GPU scheduling and PR automation.
 
 ---
 

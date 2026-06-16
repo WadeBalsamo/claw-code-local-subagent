@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/adversarial_review.sh\" --mode plan"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CODEX_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}/scripts/adversarial_review.sh\" --mode implementation"
+          }
+        ]
+      }
+    ]
+  }
+}

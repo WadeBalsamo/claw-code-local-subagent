@@ -380,7 +380,7 @@ fn configure_openrouter(
     let mut env = HashMap::new();
     env.insert(
         "OPENAI_BASE_URL".to_string(),
-        "https://openrouter.ai/api/v1".to_string(),
+        "https://openrouter.ai/api/v1/chat/completions".to_string(),
     );
     env.insert("OPENAI_API_KEY".to_string(), key.clone());
     env.insert("HTTP_REFERER".to_string(), "https://localhost".to_string());
@@ -390,7 +390,7 @@ fn configure_openrouter(
     Ok(ProviderChoice {
         kind: "openai".to_string(),
         api_key: key,
-        base_url: Some("https://openrouter.ai/api/v1".to_string()),
+        base_url: Some("https://openrouter.ai/api/v1/chat/completions".to_string()),
         model: Some(model),
         launch_env: env,
         display: "OpenRouter".to_string(),

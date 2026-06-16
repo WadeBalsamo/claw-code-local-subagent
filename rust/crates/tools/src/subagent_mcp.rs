@@ -20,16 +20,22 @@
 //!   [`run_subagent_isolated`] for the preset limitation.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use runtime::permission_enforcer::PermissionEnforcer;
-use runtime::{ConversationRuntime, PermissionMode, Session};
+use runtime::{ConversationRuntime, PermissionMode, Session, ToolError, ToolExecutor};
 
 use crate::{
     agent_permission_policy_for_mode, allowed_tools_for_subagent, build_agent_system_prompt,
@@ -39,9 +45,13 @@ use crate::{
 
 /// Default cap on the returned `summary` text, in characters.
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 4000;
+const DEFAULT_STALE_AFTER_SECS: u64 = 300;
+const DEFAULT_STOP_GRACE_SECS: u64 = 2;
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const HEARTBEAT_STOP_POLL_MS: u64 = 100;
 
 /// Input for the `run_subagent` MCP tool.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunSubagentInput {
     /// Provider routing: `local|openrouter|ollama|lmstudio|anthropic|openai|auto`.
     /// Absent/empty is treated as `auto` (use whatever env is already present).
@@ -75,6 +85,21 @@ pub struct RunSubagentInput {
     /// Preset name for `isolated: true` runs (see [`run_subagent_isolated`]).
     #[serde(default)]
     pub preset: Option<String>,
+    /// Review effort/depth hint for review-style prompts: quick|standard|deep|exhaustive.
+    #[serde(default)]
+    pub review_depth: Option<String>,
+    /// Comma-separated review focus areas, e.g. correctness,tests,security,scope.
+    #[serde(default)]
+    pub focus: Option<String>,
+    /// Review artifact scope hint: diff_only|diff_plus_tests|full_repo_context.
+    #[serde(default)]
+    pub artifact_scope: Option<String>,
+    /// Ask the reviewer to stop once it finds one concrete blocker.
+    #[serde(default)]
+    pub stop_on_first_blocker: Option<bool>,
+    /// Ask the reviewer to cite concrete evidence for findings.
+    #[serde(default)]
+    pub require_evidence: Option<bool>,
 }
 
 /// Structured result of a `run_subagent` call.
@@ -102,6 +127,141 @@ pub struct RunSubagentOutput {
     pub error: Option<String>,
     /// Wall-clock duration of the call.
     pub duration_ms: u64,
+}
+
+/// Input for starting a pollable background sub-agent run.
+pub type StartSubagentInput = RunSubagentInput;
+
+/// Input for reading a background sub-agent run status file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetSubagentInput {
+    /// Run id returned by `start_subagent`.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Optional explicit status file path returned by `start_subagent`.
+    #[serde(default)]
+    pub status_file: Option<String>,
+    /// Limit returned activity events. Defaults to all events.
+    #[serde(default)]
+    pub activity_limit: Option<usize>,
+    /// Limit returned JSONL status events. Defaults to all events.
+    #[serde(default)]
+    pub event_limit: Option<usize>,
+    /// Return only JSONL events with seq greater than this value.
+    #[serde(default)]
+    pub since_seq: Option<usize>,
+    /// Mark active runs stale when no activity has occurred for this many seconds.
+    #[serde(default)]
+    pub stale_after_secs: Option<u64>,
+}
+
+/// Input for cancelling a background sub-agent run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StopSubagentInput {
+    /// Run id returned by `start_subagent`.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Optional explicit status file path returned by `start_subagent`.
+    #[serde(default)]
+    pub status_file: Option<String>,
+    /// Seconds to wait after graceful termination before force-killing.
+    #[serde(default)]
+    pub grace_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartSubagentOutput {
+    pub status: String,
+    pub run_id: String,
+    pub provider: String,
+    pub model: String,
+    pub repo_dir: String,
+    pub status_file: String,
+    pub input_file: String,
+    pub stdout_file: String,
+    pub stderr_file: String,
+    pub events_file: String,
+    pub status_command: String,
+    pub stop_command: String,
+    pub pid: Option<u32>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentActivity {
+    pub seq: usize,
+    pub tool_name: String,
+    pub status: String,
+    pub input: Value,
+    pub observed_target: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub is_error: Option<bool>,
+    pub output_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentEvent {
+    pub seq: usize,
+    pub timestamp: String,
+    pub kind: String,
+    pub phase: Option<String>,
+    pub status: Option<String>,
+    pub message: Option<String>,
+    pub tool_name: Option<String>,
+    pub observed_target: Option<String>,
+    pub input: Option<Value>,
+    pub is_error: Option<bool>,
+    pub output_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentStatusRecord {
+    pub status: String,
+    #[serde(default)]
+    pub phase: Option<String>,
+    pub run_id: String,
+    pub provider: String,
+    pub model: String,
+    pub repo_dir: String,
+    pub status_file: String,
+    #[serde(default)]
+    pub stdout_file: Option<String>,
+    #[serde(default)]
+    pub stderr_file: Option<String>,
+    #[serde(default)]
+    pub events_file: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    pub started_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_activity_at: Option<String>,
+    #[serde(default)]
+    pub heartbeat_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub summary: String,
+    pub truncated: bool,
+    pub diff_stat: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub event_seq: usize,
+    pub activity: Vec<SubagentActivity>,
+    pub read_paths: Vec<String>,
+    #[serde(default)]
+    pub grep_patterns: Vec<String>,
+    #[serde(default)]
+    pub web_queries: Vec<String>,
+    #[serde(default)]
+    pub stop_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubagentWorkerInput {
+    run_id: String,
+    status_file: String,
+    input: RunSubagentInput,
 }
 
 impl RunSubagentOutput {
@@ -147,9 +307,73 @@ pub fn run_subagent_tool_spec() -> ToolSpec {
                 "isolated": { "type": "boolean", "description": "Run in a git worktree via the launcher (hard kill on timeout)." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "description": "Best-effort wall-clock timeout." },
                 "max_output_chars": { "type": "integer", "minimum": 1, "description": "Cap on returned summary chars (default 4000)." },
-                "preset": { "type": "string", "description": "Preset name for isolated runs." }
+                "preset": { "type": "string", "description": "Preset name for isolated runs." },
+                "review_depth": {
+                    "type": "string",
+                    "enum": ["quick", "standard", "deep", "exhaustive"],
+                    "description": "Review-depth hint for review prompts. Shapes instructions, not runtime internals."
+                },
+                "focus": { "type": "string", "description": "Comma-separated review focus areas such as correctness,tests,security,scope." },
+                "artifact_scope": {
+                    "type": "string",
+                    "enum": ["diff_only", "diff_plus_tests", "full_repo_context"],
+                    "description": "Review scope hint for how broadly to inspect artifacts."
+                },
+                "stop_on_first_blocker": { "type": "boolean", "description": "Ask a reviewer to stop after one concrete blocker." },
+                "require_evidence": { "type": "boolean", "description": "Ask a reviewer to cite concrete evidence for findings." }
             },
             "required": ["prompt"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::WorkspaceWrite,
+    }
+}
+
+/// JSON schema for the `start_subagent` tool. Same input as `run_subagent`,
+/// but it returns immediately with a run id and status file.
+#[must_use]
+pub fn start_subagent_tool_spec() -> ToolSpec {
+    let mut spec = run_subagent_tool_spec();
+    spec.name = "start_subagent";
+    spec.description = "Start a pollable local or OpenRouter sub-agent run and return a run_id plus status_file. Use get_subagent to poll status, final result, and observed read/search tool activity.";
+    spec
+}
+
+/// JSON schema for the `get_subagent` tool.
+#[must_use]
+pub fn get_subagent_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "get_subagent",
+        description: "Read the status for a pollable sub-agent run started by start_subagent, including liveness, phase, staleness, recent events, read paths, and tool activity.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "run_id": { "type": "string", "description": "Run id returned by start_subagent." },
+                "status_file": { "type": "string", "description": "Explicit status file path returned by start_subagent." },
+                "activity_limit": { "type": "integer", "minimum": 1, "description": "Limit returned activity events." },
+                "event_limit": { "type": "integer", "minimum": 1, "description": "Limit returned JSONL status events." },
+                "since_seq": { "type": "integer", "minimum": 0, "description": "Return only JSONL status events with seq greater than this value." },
+                "stale_after_secs": { "type": "integer", "minimum": 1, "description": "Mark active runs stale after this many seconds without activity." }
+            },
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    }
+}
+
+/// JSON schema for the `stop_subagent` tool.
+#[must_use]
+pub fn stop_subagent_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "stop_subagent",
+        description: "Cancel a pollable sub-agent run started by start_subagent. Sends graceful termination, then force-kills after a short grace period.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "run_id": { "type": "string", "description": "Run id returned by start_subagent." },
+                "status_file": { "type": "string", "description": "Explicit status file path returned by start_subagent." },
+                "grace_secs": { "type": "integer", "minimum": 0, "description": "Seconds to wait before force-killing after graceful termination." }
+            },
             "additionalProperties": false
         }),
         required_permission: PermissionMode::WorkspaceWrite,
@@ -189,6 +413,27 @@ pub fn handle_subagent_mcp_call(name: &str, args: &Value) -> Result<String, Stri
             let output = run_subagent(input);
             serde_json::to_string_pretty(&output)
                 .map_err(|error| format!("failed to serialize run_subagent output: {error}"))
+        }
+        "start_subagent" => {
+            let input: StartSubagentInput = serde_json::from_value(args.clone())
+                .map_err(|error| format!("invalid start_subagent input: {error}"))?;
+            let output = start_subagent(input);
+            serde_json::to_string_pretty(&output)
+                .map_err(|error| format!("failed to serialize start_subagent output: {error}"))
+        }
+        "get_subagent" => {
+            let input: GetSubagentInput = serde_json::from_value(args.clone())
+                .map_err(|error| format!("invalid get_subagent input: {error}"))?;
+            let output = get_subagent(input);
+            serde_json::to_string_pretty(&output)
+                .map_err(|error| format!("failed to serialize get_subagent output: {error}"))
+        }
+        "stop_subagent" => {
+            let input: StopSubagentInput = serde_json::from_value(args.clone())
+                .map_err(|error| format!("invalid stop_subagent input: {error}"))?;
+            let output = stop_subagent(input);
+            serde_json::to_string_pretty(&output)
+                .map_err(|error| format!("failed to serialize stop_subagent output: {error}"))
         }
         "list_presets" => {
             let presets = list_presets();
@@ -285,6 +530,1374 @@ pub fn run_subagent(input: RunSubagentInput) -> RunSubagentOutput {
     run_subagent_in_process(&input, &provider, &model, &repo_dir, started)
 }
 
+/// Start a background sub-agent run that can be polled with [`get_subagent`].
+#[must_use]
+pub fn start_subagent(input: StartSubagentInput) -> StartSubagentOutput {
+    let provider = input
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+        .to_lowercase();
+    let model = resolve_agent_model(input.model.as_deref());
+    let repo_dir = input
+        .repo_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            },
+            ToString::to_string,
+        );
+    let run_id = make_subagent_run_id();
+    let run_dir = subagent_run_dir(&run_id);
+    let status_file = run_dir.join("status.json");
+    let input_file = run_dir.join("input.json");
+    let stdout_file = run_dir.join("worker.stdout.log");
+    let stderr_file = run_dir.join("worker.stderr.log");
+    let events_file = run_dir.join("events.jsonl");
+    let status_command = status_command_for_file(&status_file, &subagent_run_root());
+    let stop_command = stop_command_for_file(&status_file, &subagent_run_root());
+
+    let failed = |error: String| StartSubagentOutput {
+        status: "failed".to_string(),
+        run_id: run_id.clone(),
+        provider: provider.clone(),
+        model: model.clone(),
+        repo_dir: repo_dir.clone(),
+        status_file: status_file.display().to_string(),
+        input_file: input_file.display().to_string(),
+        stdout_file: stdout_file.display().to_string(),
+        stderr_file: stderr_file.display().to_string(),
+        events_file: events_file.display().to_string(),
+        status_command: status_command.clone(),
+        stop_command: stop_command.clone(),
+        pid: None,
+        error: Some(error),
+    };
+
+    if input.prompt.trim().is_empty() {
+        return failed("prompt must not be empty".to_string());
+    }
+    if let Err(error) = fs::create_dir_all(&run_dir) {
+        return failed(format!(
+            "failed to create run dir {}: {error}",
+            run_dir.display()
+        ));
+    }
+
+    let now = timestamp_now();
+    let record = SubagentStatusRecord {
+        status: "starting".to_string(),
+        phase: Some("queued".to_string()),
+        run_id: run_id.clone(),
+        provider: provider.clone(),
+        model: model.clone(),
+        repo_dir: repo_dir.clone(),
+        status_file: status_file.display().to_string(),
+        stdout_file: Some(stdout_file.display().to_string()),
+        stderr_file: Some(stderr_file.display().to_string()),
+        events_file: Some(events_file.display().to_string()),
+        pid: None,
+        started_at: now.clone(),
+        updated_at: now.clone(),
+        last_activity_at: Some(now.clone()),
+        heartbeat_at: Some(now),
+        completed_at: None,
+        summary: String::new(),
+        truncated: false,
+        diff_stat: None,
+        error: None,
+        duration_ms: 0,
+        event_seq: 0,
+        activity: Vec::new(),
+        read_paths: Vec::new(),
+        grep_patterns: Vec::new(),
+        web_queries: Vec::new(),
+        stop_command: Some(stop_command.clone()),
+    };
+    if let Err(error) = write_status_record(&status_file, &record) {
+        return failed(error);
+    }
+    let _ = record_status_event(
+        &status_file,
+        "phase_started",
+        Some("queued"),
+        Some("sub-agent run queued"),
+        None,
+    );
+
+    let worker_input = SubagentWorkerInput {
+        run_id: run_id.clone(),
+        status_file: status_file.display().to_string(),
+        input,
+    };
+    let serialized = match serde_json::to_string_pretty(&worker_input) {
+        Ok(serialized) => serialized,
+        Err(error) => return failed(format!("failed to serialize worker input: {error}")),
+    };
+    if let Err(error) = fs::write(&input_file, serialized) {
+        return failed(format!(
+            "failed to write worker input {}: {error}",
+            input_file.display()
+        ));
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return failed(format!("failed to resolve current executable: {error}")),
+    };
+    match spawn_subagent_worker(
+        &exe,
+        &input_file,
+        &stdout_file,
+        &stderr_file,
+        &status_file,
+        &repo_dir,
+    ) {
+        Ok(pid) => {
+            let _ = update_status_file(&status_file, |record| {
+                record.pid = Some(pid);
+                record.updated_at = timestamp_now();
+            });
+            StartSubagentOutput {
+                status: "started".to_string(),
+                run_id,
+                provider,
+                model,
+                repo_dir,
+                status_file: status_file.display().to_string(),
+                input_file: input_file.display().to_string(),
+                stdout_file: stdout_file.display().to_string(),
+                stderr_file: stderr_file.display().to_string(),
+                events_file: events_file.display().to_string(),
+                status_command,
+                stop_command,
+                pid: Some(pid),
+                error: None,
+            }
+        }
+        Err(error) => {
+            let _ = update_status_file(&status_file, |record| {
+                record.status = "failed".to_string();
+                record.error = Some(error.clone());
+                record.completed_at = Some(timestamp_now());
+            });
+            failed(error)
+        }
+    }
+}
+
+/// Return the persisted status for a background sub-agent run.
+#[must_use]
+pub fn get_subagent(input: GetSubagentInput) -> Value {
+    let status_path = match resolve_status_path(&input) {
+        Ok(path) => path,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "error": error,
+            });
+        }
+    };
+    let raw = match fs::read_to_string(&status_path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return json!({
+                "status": "missing",
+                "status_file": status_path.display().to_string(),
+                "error": format!("failed to read status file: {error}"),
+            });
+        }
+    };
+    let mut record: SubagentStatusRecord = match serde_json::from_str(&raw) {
+        Ok(record) => record,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "status_file": status_path.display().to_string(),
+                "error": format!("failed to parse status file: {error}"),
+            });
+        }
+    };
+    let worker_alive = record
+        .pid
+        .filter(|_| is_active_subagent_status(&record.status))
+        .and_then(process_is_alive);
+    if worker_alive == Some(false) && is_active_subagent_status(&record.status) {
+        let now = timestamp_now();
+        record.status = "failed".to_string();
+        record.phase = Some("failed".to_string());
+        record.error = Some(
+            "sub-agent worker exited before writing a terminal status; see stderr_file/stdout_file"
+                .to_string(),
+        );
+        record.duration_ms = elapsed_ms_since_timestamp(&record.started_at);
+        record.diff_stat = git_diff_stat(&record.repo_dir);
+        record.completed_at = Some(now.clone());
+        record.updated_at = now;
+        let _ = write_status_record(&status_path, &record);
+        let _ = record_status_event(
+            &status_path,
+            "terminal",
+            Some("failed"),
+            Some("sub-agent worker exited before terminal status"),
+            None,
+        );
+    }
+    let stale_after_secs = input.stale_after_secs.unwrap_or(DEFAULT_STALE_AFTER_SECS);
+    let stale = is_active_subagent_status(&record.status)
+        && millis_since_optional(record.last_activity_at.as_deref())
+            .is_some_and(|elapsed| elapsed >= u128::from(stale_after_secs) * 1000);
+    let stale_reason = stale.then(|| {
+        format!(
+            "no activity for at least {stale_after_secs}s; use stop_subagent/claw subagent stop to cancel if it is frozen"
+        )
+    });
+    let event_count = record.event_seq;
+    let events = read_status_events(&record, input.since_seq, input.event_limit);
+    if let Some(limit) = input.activity_limit {
+        if record.activity.len() > limit {
+            let keep_from = record.activity.len() - limit;
+            record.activity = record.activity.split_off(keep_from);
+        }
+    }
+    let mut value = serde_json::to_value(record).expect("subagent status should serialize");
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "worker_alive".to_string(),
+            worker_alive.map_or(Value::Null, Value::Bool),
+        );
+        object.insert("stale".to_string(), Value::Bool(stale));
+        object.insert(
+            "stale_after_secs".to_string(),
+            Value::from(stale_after_secs),
+        );
+        object.insert(
+            "stale_reason".to_string(),
+            stale_reason.map_or(Value::Null, Value::String),
+        );
+        object.insert("event_count".to_string(), Value::from(event_count));
+        object.insert(
+            "events".to_string(),
+            serde_json::to_value(events).unwrap_or_else(|_| Value::Array(Vec::new())),
+        );
+    }
+    value
+}
+
+/// Cancel a pollable sub-agent run.
+#[must_use]
+pub fn stop_subagent(input: StopSubagentInput) -> Value {
+    let status_path = match resolve_stop_status_path(&input) {
+        Ok(path) => path,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "error": error,
+            });
+        }
+    };
+    let raw = match fs::read_to_string(&status_path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return json!({
+                "status": "missing",
+                "status_file": status_path.display().to_string(),
+                "error": format!("failed to read status file: {error}"),
+            });
+        }
+    };
+    let record: SubagentStatusRecord = match serde_json::from_str(&raw) {
+        Ok(record) => record,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "status_file": status_path.display().to_string(),
+                "error": format!("failed to parse status file: {error}"),
+            });
+        }
+    };
+    if !is_active_subagent_status(&record.status) {
+        return json!({
+            "status": record.status,
+            "status_file": status_path.display().to_string(),
+            "message": "sub-agent run is already terminal",
+        });
+    }
+
+    let grace_secs = input.grace_secs.unwrap_or(DEFAULT_STOP_GRACE_SECS);
+    let mut termination_error = None;
+    let mut force_killed = false;
+    if let Some(pid) = record.pid {
+        if process_is_alive(pid) == Some(true) {
+            if let Err(error) = terminate_process(pid, false) {
+                termination_error = Some(error);
+            }
+            if grace_secs > 0 {
+                std::thread::sleep(Duration::from_secs(grace_secs));
+            }
+            if process_is_alive(pid) == Some(true) {
+                force_killed = true;
+                if let Err(error) = terminate_process(pid, true) {
+                    termination_error = Some(error);
+                }
+            }
+        }
+    }
+
+    let now = timestamp_now();
+    let message = if let Some(error) = termination_error {
+        format!("cancel requested, but process termination reported: {error}")
+    } else if force_killed {
+        "cancelled by parent agent after force-kill".to_string()
+    } else {
+        "cancelled by parent agent".to_string()
+    };
+    let _ = update_status_file(&status_path, |record| {
+        record.status = "cancelled".to_string();
+        record.phase = Some("cancelled".to_string());
+        record.error = Some(message.clone());
+        record.duration_ms = elapsed_ms_since_timestamp(&record.started_at);
+        record.diff_stat = git_diff_stat(&record.repo_dir);
+        record.completed_at = Some(now.clone());
+        record.updated_at = now.clone();
+        record.last_activity_at = Some(now.clone());
+        record.heartbeat_at = Some(now.clone());
+    });
+    let _ = record_status_event(
+        &status_path,
+        "terminal",
+        Some("cancelled"),
+        Some(&message),
+        None,
+    );
+
+    json!({
+        "status": "cancelled",
+        "status_file": status_path.display().to_string(),
+        "message": message,
+        "force_killed": force_killed,
+    })
+}
+
+/// Execute a status-file-backed sub-agent worker. Intended for the hidden
+/// `claw subagent run-worker --input-file <path>` CLI entrypoint.
+pub fn run_subagent_worker_from_file(input_file: &Path) -> Result<(), String> {
+    let raw = fs::read_to_string(input_file).map_err(|error| {
+        format!(
+            "failed to read worker input {}: {error}",
+            input_file.display()
+        )
+    })?;
+    let worker: SubagentWorkerInput = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "failed to parse worker input {}: {error}",
+            input_file.display()
+        )
+    })?;
+    let status_path = PathBuf::from(&worker.status_file);
+    run_observed_subagent(worker.input, worker.run_id, status_path);
+    Ok(())
+}
+
+fn run_observed_subagent(input: RunSubagentInput, run_id: String, status_path: PathBuf) {
+    let started = Instant::now();
+    let provider = input
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+        .to_lowercase();
+    let model = resolve_agent_model(input.model.as_deref());
+    let repo_dir = input
+        .repo_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            },
+            ToString::to_string,
+        );
+
+    let _ = update_status_file(&status_path, |record| {
+        record.status = "running".to_string();
+        record.phase = Some("initializing".to_string());
+        let now = timestamp_now();
+        record.updated_at = now.clone();
+        record.last_activity_at = Some(now.clone());
+        record.heartbeat_at = Some(now);
+    });
+    let _ = record_status_event(
+        &status_path,
+        "phase_started",
+        Some("initializing"),
+        Some("sub-agent worker started"),
+        None,
+    );
+
+    if input.isolated.unwrap_or(false) {
+        let _ = record_status_event(
+            &status_path,
+            "phase_started",
+            Some("isolated_launcher"),
+            Some("starting isolated launcher"),
+            None,
+        );
+        let effective_input = input_with_review_controls(&input);
+        let output = run_subagent_isolated(&effective_input, &provider, &model, &repo_dir);
+        let status = output.status.clone();
+        let phase = if status == "completed" {
+            "completed".to_string()
+        } else {
+            status.clone()
+        };
+        let _ = update_status_file(&status_path, |record| {
+            record.status = status;
+            record.phase = Some(phase.clone());
+            record.summary = output.summary;
+            record.truncated = output.truncated;
+            record.error = output.error;
+            record.duration_ms = elapsed_ms(started);
+            record.diff_stat = output.diff_stat;
+            let now = timestamp_now();
+            record.completed_at = Some(now.clone());
+            record.updated_at = now.clone();
+            record.last_activity_at = Some(now.clone());
+            record.heartbeat_at = Some(now);
+        });
+        let _ = record_status_event(
+            &status_path,
+            "terminal",
+            Some(&phase),
+            Some("isolated launcher finished"),
+            None,
+        );
+        let _ = run_id;
+        return;
+    }
+
+    let _env_guard = apply_provider_env(&provider, &model);
+    let _cwd_guard = match CwdGuard::enter(input.repo_dir.as_deref()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = mark_status_terminal(
+                &status_path,
+                "failed",
+                None,
+                Some(error),
+                elapsed_ms(started),
+                &repo_dir,
+            );
+            return;
+        }
+    };
+
+    let status_record = match fs::read_to_string(&status_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<SubagentStatusRecord>(&raw).ok())
+    {
+        Some(record) => Arc::new(Mutex::new(record)),
+        None => {
+            let _ = mark_status_terminal(
+                &status_path,
+                "failed",
+                None,
+                Some("status file disappeared before worker started".to_string()),
+                elapsed_ms(started),
+                &repo_dir,
+            );
+            return;
+        }
+    };
+
+    let subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
+    let permission_mode = parse_permission_mode(input.permission_mode.as_deref());
+    let allowed_tools = allowed_tools_for_subagent(&subagent_type);
+    let max_output_chars = input.max_output_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
+    let timeout = input.timeout_secs.map(Duration::from_secs);
+    let prompt = prompt_with_review_controls(&input);
+    let max_iterations = max_iterations_for_input(&input);
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat = spawn_status_heartbeat(
+        Arc::clone(&status_record),
+        status_path.clone(),
+        Arc::clone(&heartbeat_stop),
+    );
+
+    let run = {
+        let status_record = Arc::clone(&status_record);
+        let status_path = status_path.clone();
+        let model = model.clone();
+        move || -> Result<String, String> {
+            {
+                let mut record = lock_status(&status_record);
+                record.phase = Some("model_turn".to_string());
+                let event = status_event(
+                    &mut record,
+                    "phase_started",
+                    Some("model_turn"),
+                    Some("starting model/tool loop"),
+                    None,
+                );
+                let _ = write_status_record(&status_path, &record);
+                let _ = append_event_for_record(&record, &event);
+            }
+            let system_prompt = build_agent_system_prompt(&subagent_type, &model)?;
+            let api_client = ProviderRuntimeClient::new(model.clone(), allowed_tools.clone())?;
+            let permission_policy = agent_permission_policy_for_mode(permission_mode);
+            let inner = SubagentToolExecutor::new(allowed_tools)
+                .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+            let tool_executor = ObservedToolExecutor {
+                inner,
+                status_record,
+                status_path,
+            };
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                api_client,
+                tool_executor,
+                permission_policy,
+                system_prompt,
+            )
+            .with_max_iterations(max_iterations);
+            let summary = runtime
+                .run_turn(prompt, None)
+                .map_err(|error| error.to_string())?;
+            Ok(final_assistant_text(&summary))
+        }
+    };
+
+    match run_with_optional_timeout(run, timeout) {
+        TurnResult::Completed(text) => {
+            heartbeat_stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = heartbeat {
+                let _ = handle.join();
+            }
+            let (summary, truncated) = truncate_summary(&text, max_output_chars);
+            let _ = update_status_file(&status_path, |record| {
+                record.status = "completed".to_string();
+                record.phase = Some("completed".to_string());
+                record.summary = summary;
+                record.truncated = truncated;
+                record.error = None;
+                record.duration_ms = elapsed_ms(started);
+                record.diff_stat = git_diff_stat(&repo_dir);
+                let now = timestamp_now();
+                record.completed_at = Some(now.clone());
+                record.updated_at = now.clone();
+                record.last_activity_at = Some(now.clone());
+                record.heartbeat_at = Some(now);
+            });
+            let _ = record_status_event(
+                &status_path,
+                "terminal",
+                Some("completed"),
+                Some("sub-agent completed"),
+                None,
+            );
+        }
+        TurnResult::Failed(error) => {
+            heartbeat_stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = heartbeat {
+                let _ = handle.join();
+            }
+            let _ = mark_status_terminal(
+                &status_path,
+                "failed",
+                None,
+                Some(error),
+                elapsed_ms(started),
+                &repo_dir,
+            );
+        }
+        TurnResult::TimedOut => {
+            heartbeat_stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = heartbeat {
+                let _ = handle.join();
+            }
+            let _ = mark_status_terminal(
+                &status_path,
+                "timeout",
+                None,
+                Some(
+                    "sub-agent turn exceeded timeout; the worker process marked the run timed out"
+                        .to_string(),
+                ),
+                elapsed_ms(started),
+                &repo_dir,
+            );
+        }
+    }
+
+    let _ = run_id;
+}
+
+struct ObservedToolExecutor {
+    inner: SubagentToolExecutor,
+    status_record: Arc<Mutex<SubagentStatusRecord>>,
+    status_path: PathBuf,
+}
+
+impl ToolExecutor for ObservedToolExecutor {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let input_value = serde_json::from_str::<Value>(input)
+            .unwrap_or_else(|_| Value::String(input.to_string()));
+        let observed_target = observed_tool_target(tool_name, &input_value);
+        let seq = {
+            let mut record = lock_status(&self.status_record);
+            let seq = record.activity.len() + 1;
+            record.phase = Some(format!("tool:{tool_name}"));
+            record.activity.push(SubagentActivity {
+                seq,
+                tool_name: tool_name.to_string(),
+                status: "running".to_string(),
+                input: input_value.clone(),
+                observed_target: observed_target.clone(),
+                started_at: timestamp_now(),
+                finished_at: None,
+                is_error: None,
+                output_chars: None,
+            });
+            if tool_name == "read_file" {
+                if let Some(path) = observed_target.as_deref() {
+                    if !record.read_paths.iter().any(|existing| existing == path) {
+                        record.read_paths.push(path.to_string());
+                    }
+                }
+            }
+            match tool_name {
+                "grep_search" => {
+                    if let Some(pattern) = observed_target.as_deref() {
+                        if !record
+                            .grep_patterns
+                            .iter()
+                            .any(|existing| existing == pattern)
+                        {
+                            record.grep_patterns.push(pattern.to_string());
+                        }
+                    }
+                }
+                "WebSearch" => {
+                    if let Some(query) = observed_target.as_deref() {
+                        if !record.web_queries.iter().any(|existing| existing == query) {
+                            record.web_queries.push(query.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let event = status_event(
+                &mut record,
+                "tool_started",
+                Some(&format!("tool:{tool_name}")),
+                Some("tool call started"),
+                Some(ToolEventPayload {
+                    tool_name,
+                    status: "running",
+                    input: Some(input_value.clone()),
+                    observed_target: observed_target.clone(),
+                    is_error: None,
+                    output_chars: None,
+                }),
+            );
+            let _ = write_status_record(&self.status_path, &record);
+            let _ = append_event_for_record(&record, &event);
+            seq
+        };
+
+        let result = self.inner.execute(tool_name, input);
+        let (is_error, output_chars) = match &result {
+            Ok(output) => (false, output.chars().count()),
+            Err(error) => (true, error.to_string().chars().count()),
+        };
+        {
+            let mut record = lock_status(&self.status_record);
+            if let Some(activity) = record
+                .activity
+                .iter_mut()
+                .find(|activity| activity.seq == seq)
+            {
+                activity.status = if is_error { "failed" } else { "completed" }.to_string();
+                activity.finished_at = Some(timestamp_now());
+                activity.is_error = Some(is_error);
+                activity.output_chars = Some(output_chars);
+            }
+            let event = status_event(
+                &mut record,
+                "tool_finished",
+                Some(&format!("tool:{tool_name}")),
+                Some("tool call finished"),
+                Some(ToolEventPayload {
+                    tool_name,
+                    status: if is_error { "failed" } else { "completed" },
+                    input: None,
+                    observed_target,
+                    is_error: Some(is_error),
+                    output_chars: Some(output_chars),
+                }),
+            );
+            let _ = write_status_record(&self.status_path, &record);
+            let _ = append_event_for_record(&record, &event);
+        }
+        result
+    }
+}
+
+fn lock_status(
+    status_record: &Arc<Mutex<SubagentStatusRecord>>,
+) -> std::sync::MutexGuard<'_, SubagentStatusRecord> {
+    status_record
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn observed_tool_target(tool_name: &str, input: &Value) -> Option<String> {
+    let field = match tool_name {
+        "read_file" => "path",
+        "glob_search" => "pattern",
+        "grep_search" => "pattern",
+        "WebFetch" => "url",
+        "WebSearch" => "query",
+        "Skill" => "skill",
+        _ => return None,
+    };
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+struct ToolEventPayload<'a> {
+    tool_name: &'a str,
+    status: &'a str,
+    input: Option<Value>,
+    observed_target: Option<String>,
+    is_error: Option<bool>,
+    output_chars: Option<usize>,
+}
+
+fn status_event(
+    record: &mut SubagentStatusRecord,
+    kind: &str,
+    phase: Option<&str>,
+    message: Option<&str>,
+    tool: Option<ToolEventPayload<'_>>,
+) -> SubagentEvent {
+    let now = timestamp_now();
+    record.event_seq += 1;
+    record.updated_at = now.clone();
+    record.last_activity_at = Some(now.clone());
+    record.heartbeat_at = Some(now.clone());
+    if let Some(phase) = phase {
+        record.phase = Some(phase.to_string());
+    }
+    let (tool_name, status, input, observed_target, is_error, output_chars) = match tool {
+        Some(tool) => (
+            Some(tool.tool_name.to_string()),
+            Some(tool.status.to_string()),
+            tool.input,
+            tool.observed_target,
+            tool.is_error,
+            tool.output_chars,
+        ),
+        None => (None, None, None, None, None, None),
+    };
+    SubagentEvent {
+        seq: record.event_seq,
+        timestamp: now,
+        kind: kind.to_string(),
+        phase: phase
+            .map(ToString::to_string)
+            .or_else(|| record.phase.clone()),
+        status,
+        message: message.map(ToString::to_string),
+        tool_name,
+        observed_target,
+        input,
+        is_error,
+        output_chars,
+    }
+}
+
+fn record_status_event(
+    status_path: &Path,
+    kind: &str,
+    phase: Option<&str>,
+    message: Option<&str>,
+    tool: Option<ToolEventPayload<'_>>,
+) -> Result<(), String> {
+    let raw = fs::read_to_string(status_path).map_err(|error| {
+        format!(
+            "failed to read status file {}: {error}",
+            status_path.display()
+        )
+    })?;
+    let mut record: SubagentStatusRecord = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "failed to parse status file {}: {error}",
+            status_path.display()
+        )
+    })?;
+    let event = status_event(&mut record, kind, phase, message, tool);
+    write_status_record(status_path, &record)?;
+    append_event_for_record(&record, &event)
+}
+
+fn append_event_for_record(
+    record: &SubagentStatusRecord,
+    event: &SubagentEvent,
+) -> Result<(), String> {
+    let Some(path) = record.events_file.as_deref() else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("failed to create events dir {}: {error}", parent.display())
+        })?;
+    }
+    let mut payload = serde_json::to_string(event)
+        .map_err(|error| format!("failed to serialize sub-agent event: {error}"))?;
+    payload.push('\n');
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open events file {}: {error}", path.display()))?;
+    file.write_all(payload.as_bytes())
+        .map_err(|error| format!("failed to append events file {}: {error}", path.display()))
+}
+
+fn read_status_events(
+    record: &SubagentStatusRecord,
+    since_seq: Option<usize>,
+    limit: Option<usize>,
+) -> Vec<SubagentEvent> {
+    let Some(path) = record.events_file.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let min_seq = since_seq.unwrap_or_default();
+    let mut events = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<SubagentEvent>(line).ok())
+        .filter(|event| event.seq > min_seq)
+        .collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        if events.len() > limit {
+            let keep_from = events.len() - limit;
+            events = events.split_off(keep_from);
+        }
+    }
+    events
+}
+
+fn spawn_status_heartbeat(
+    status_record: Arc<Mutex<SubagentStatusRecord>>,
+    status_path: PathBuf,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("claw-subagent-heartbeat".to_string())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                for _ in 0..(HEARTBEAT_INTERVAL_SECS * 1000 / HEARTBEAT_STOP_POLL_MS) {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(HEARTBEAT_STOP_POLL_MS));
+                }
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut record = lock_status(&status_record);
+                if !is_active_subagent_status(&record.status) {
+                    break;
+                }
+                record.heartbeat_at = Some(timestamp_now());
+                record.updated_at = record.heartbeat_at.clone().unwrap_or_default();
+                let _ = write_status_record(&status_path, &record);
+            }
+        })
+        .ok()
+}
+
+fn mark_status_terminal(
+    status_path: &Path,
+    status: &str,
+    summary: Option<String>,
+    error: Option<String>,
+    duration_ms: u64,
+    repo_dir: &str,
+) -> Result<(), String> {
+    let result = update_status_file(status_path, |record| {
+        record.status = status.to_string();
+        record.phase = Some(status.to_string());
+        if let Some(summary) = summary {
+            record.summary = summary;
+        }
+        record.error = error;
+        record.duration_ms = duration_ms;
+        record.diff_stat = git_diff_stat(repo_dir);
+        let now = timestamp_now();
+        record.completed_at = Some(now.clone());
+        record.updated_at = now.clone();
+        record.last_activity_at = Some(now.clone());
+        record.heartbeat_at = Some(now);
+    });
+    let _ = record_status_event(
+        status_path,
+        "terminal",
+        Some(status),
+        Some(&format!("sub-agent finished with status {status}")),
+        None,
+    );
+    result
+}
+
+fn update_status_file(
+    status_path: &Path,
+    update: impl FnOnce(&mut SubagentStatusRecord),
+) -> Result<(), String> {
+    let raw = fs::read_to_string(status_path).map_err(|error| {
+        format!(
+            "failed to read status file {}: {error}",
+            status_path.display()
+        )
+    })?;
+    let mut record: SubagentStatusRecord = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "failed to parse status file {}: {error}",
+            status_path.display()
+        )
+    })?;
+    update(&mut record);
+    write_status_record(status_path, &record)
+}
+
+fn write_status_record(status_path: &Path, record: &SubagentStatusRecord) -> Result<(), String> {
+    if let Some(parent) = status_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("failed to create status dir {}: {error}", parent.display())
+        })?;
+    }
+    let tmp = status_path.with_extension("json.tmp");
+    let payload = serde_json::to_string_pretty(record)
+        .map_err(|error| format!("failed to serialize status record: {error}"))?;
+    fs::write(&tmp, payload).map_err(|error| {
+        format!(
+            "failed to write status temp file {}: {error}",
+            tmp.display()
+        )
+    })?;
+    fs::rename(&tmp, status_path).map_err(|error| {
+        format!(
+            "failed to move status temp file {} to {}: {error}",
+            tmp.display(),
+            status_path.display()
+        )
+    })
+}
+
+fn resolve_status_path(input: &GetSubagentInput) -> Result<PathBuf, String> {
+    if let Some(path) = input
+        .status_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return resolve_explicit_status_path(path);
+    }
+    let run_id = input
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "get_subagent requires run_id or status_file".to_string())?;
+    if !run_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(format!("invalid run_id `{run_id}`"));
+    }
+    Ok(subagent_run_dir(run_id).join("status.json"))
+}
+
+fn resolve_stop_status_path(input: &StopSubagentInput) -> Result<PathBuf, String> {
+    resolve_status_path(&GetSubagentInput {
+        run_id: input.run_id.clone(),
+        status_file: input.status_file.clone(),
+        activity_limit: None,
+        event_limit: None,
+        since_seq: None,
+        stale_after_secs: None,
+    })
+}
+
+fn resolve_explicit_status_path(path: &str) -> Result<PathBuf, String> {
+    let status_path = PathBuf::from(path);
+    if !status_path.is_absolute() {
+        return Err("status_file must be an absolute path returned by start_subagent".to_string());
+    }
+    if status_path.file_name().and_then(|name| name.to_str()) != Some("status.json") {
+        return Err("status_file must point to a sub-agent status.json file".to_string());
+    }
+    if has_parent_component(&status_path) {
+        return Err("status_file must not contain parent-directory components".to_string());
+    }
+
+    let root = subagent_run_root();
+    let root_for_check = fs::canonicalize(&root).unwrap_or(root);
+    if status_path.exists() {
+        let canonical_status = fs::canonicalize(&status_path).map_err(|error| {
+            format!(
+                "failed to canonicalize status_file {}: {error}",
+                status_path.display()
+            )
+        })?;
+        if !canonical_status.starts_with(&root_for_check) {
+            return Err(format!(
+                "status_file must be under {}",
+                root_for_check.display()
+            ));
+        }
+    } else if !status_path.starts_with(&root_for_check) {
+        return Err(format!(
+            "status_file must be under {}",
+            root_for_check.display()
+        ));
+    }
+    Ok(status_path)
+}
+
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn status_command_for_file(status_file: &Path, run_root: &Path) -> String {
+    format!(
+        "CLAW_SUBAGENT_RUN_DIR={} claw subagent status --status-file {}",
+        shell_quote(&run_root.display().to_string()),
+        shell_quote(&status_file.display().to_string())
+    )
+}
+
+fn stop_command_for_file(status_file: &Path, run_root: &Path) -> String {
+    format!(
+        "CLAW_SUBAGENT_RUN_DIR={} claw subagent stop --status-file {}",
+        shell_quote(&run_root.display().to_string()),
+        shell_quote(&status_file.display().to_string())
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | ':' | '+'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn make_subagent_run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("subagent-{}-{nanos}", std::process::id())
+}
+
+fn subagent_run_dir(run_id: &str) -> PathBuf {
+    subagent_run_root().join(run_id)
+}
+
+fn subagent_run_root() -> PathBuf {
+    let root = std::env::var_os("CLAW_SUBAGENT_RUN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("claw-subagent-runs"));
+    if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(root)
+    }
+}
+
+fn timestamp_now() -> String {
+    format!("{}", now_millis())
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn elapsed_ms_since_timestamp(started_at: &str) -> u64 {
+    started_at
+        .parse::<u128>()
+        .ok()
+        .map(|started| now_millis().saturating_sub(started))
+        .and_then(|elapsed| u64::try_from(elapsed).ok())
+        .unwrap_or_default()
+}
+
+fn millis_since_optional(started_at: Option<&str>) -> Option<u128> {
+    started_at
+        .and_then(|value| value.parse::<u128>().ok())
+        .map(|started| now_millis().saturating_sub(started))
+}
+
+fn is_active_subagent_status(status: &str) -> bool {
+    matches!(status, "starting" | "running")
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .map(|status| status.success())
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(false);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(stdout.lines().any(|line| line.contains(&pid.to_string())))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32, force: bool) -> Result<(), String> {
+    let signal = if force { "-9" } else { "-TERM" };
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed to invoke kill for pid {pid}: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("kill {signal} {pid} exited with {status}"))
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32, force: bool) -> Result<(), String> {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T"]);
+    if force {
+        command.arg("/F");
+    }
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed to invoke taskkill for pid {pid}: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("taskkill for pid {pid} exited with {status}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process(_pid: u32, _force: bool) -> Result<(), String> {
+    Err("process termination is unsupported on this platform".to_string())
+}
+
+fn spawn_subagent_worker(
+    exe: &Path,
+    input_file: &Path,
+    stdout_file: &Path,
+    stderr_file: &Path,
+    status_file: &Path,
+    repo_dir: &str,
+) -> Result<u32, String> {
+    let stdout = fs::File::create(stdout_file).map_err(|error| {
+        format!(
+            "failed to create worker stdout log {}: {error}",
+            stdout_file.display()
+        )
+    })?;
+    let stderr = fs::File::create(stderr_file).map_err(|error| {
+        format!(
+            "failed to create worker stderr log {}: {error}",
+            stderr_file.display()
+        )
+    })?;
+    let mut command = Command::new(exe);
+    command
+        .arg("subagent")
+        .arg("run-worker")
+        .arg("--input-file")
+        .arg(input_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn worker: {error}"))?;
+    Ok(spawn_subagent_reaper(
+        child,
+        status_file.to_path_buf(),
+        repo_dir.to_string(),
+    ))
+}
+
+fn spawn_subagent_reaper(mut child: Child, status_path: PathBuf, repo_dir: String) -> u32 {
+    let pid = child.id();
+    let _ = std::thread::Builder::new()
+        .name(format!("claw-subagent-reaper-{pid}"))
+        .spawn(move || {
+            let wait_result = child.wait();
+            let raw = match fs::read_to_string(&status_path) {
+                Ok(raw) => raw,
+                Err(_) => return,
+            };
+            let mut record: SubagentStatusRecord = match serde_json::from_str(&raw) {
+                Ok(record) => record,
+                Err(_) => return,
+            };
+            if !is_active_subagent_status(&record.status) {
+                return;
+            }
+
+            let now = timestamp_now();
+            record.status = "failed".to_string();
+            record.error = Some(match wait_result {
+                Ok(status) => format!(
+                    "sub-agent worker exited before writing a terminal status ({status}); see stderr_file/stdout_file"
+                ),
+                Err(error) => format!(
+                    "failed to wait for sub-agent worker before terminal status: {error}; see stderr_file/stdout_file"
+                ),
+            });
+            record.duration_ms = elapsed_ms_since_timestamp(&record.started_at);
+            record.diff_stat = git_diff_stat(&repo_dir);
+            record.completed_at = Some(now.clone());
+            record.updated_at = now;
+            let _ = write_status_record(&status_path, &record);
+        });
+    pid
+}
+
+fn input_with_review_controls(input: &RunSubagentInput) -> RunSubagentInput {
+    let mut effective = input.clone();
+    effective.prompt = prompt_with_review_controls(input);
+    effective.review_depth = None;
+    effective.focus = None;
+    effective.artifact_scope = None;
+    effective.stop_on_first_blocker = None;
+    effective.require_evidence = None;
+    effective
+}
+
+fn prompt_with_review_controls(input: &RunSubagentInput) -> String {
+    let review_depth = input
+        .review_depth
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let focus = input
+        .focus
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let artifact_scope = input
+        .artifact_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let has_controls = review_depth.is_some()
+        || focus.is_some()
+        || artifact_scope.is_some()
+        || input.stop_on_first_blocker.is_some()
+        || input.require_evidence.is_some();
+    if !has_controls {
+        return input.prompt.clone();
+    }
+
+    let mut controls = Vec::new();
+    controls.push("=== REVIEW CONTROLS ===".to_string());
+    if let Some(value) = review_depth {
+        controls.push(format!("Review depth: {value}"));
+    }
+    if let Some(value) = focus {
+        controls.push(format!("Focus: {value}"));
+    }
+    if let Some(value) = artifact_scope {
+        controls.push(format!("Artifact scope: {value}"));
+    }
+    if let Some(value) = input.stop_on_first_blocker {
+        controls.push(format!("Stop on first blocker: {value}"));
+    }
+    if let Some(value) = input.require_evidence {
+        controls.push(format!("Require evidence: {value}"));
+    }
+    controls.push(
+        "Treat these as effort and scope controls for the review. They do not limit your ability to inspect necessary files.".to_string(),
+    );
+    controls.push("=== TASK ===".to_string());
+    controls.push(input.prompt.clone());
+    controls.join("\n")
+}
+
+fn max_iterations_for_input(input: &RunSubagentInput) -> usize {
+    match input
+        .review_depth
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("quick") => DEFAULT_AGENT_MAX_ITERATIONS,
+        Some("standard") => DEFAULT_AGENT_MAX_ITERATIONS * 2,
+        Some("deep") => DEFAULT_AGENT_MAX_ITERATIONS * 6,
+        Some("exhaustive") => DEFAULT_AGENT_MAX_ITERATIONS * 12,
+        _ => DEFAULT_AGENT_MAX_ITERATIONS,
+    }
+}
+
 /// In-process backend: build a runtime locally and run a single turn inline.
 fn run_subagent_in_process(
     input: &RunSubagentInput,
@@ -313,10 +1926,11 @@ fn run_subagent_in_process(
 
     let max_output_chars = input.max_output_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
     let timeout = input.timeout_secs.map(Duration::from_secs);
+    let max_iterations = max_iterations_for_input(input);
 
     // Owned copies to move into the worker thread.
     let model_owned = model.to_string();
-    let prompt = input.prompt.clone();
+    let prompt = prompt_with_review_controls(input);
 
     let run = move || -> Result<String, String> {
         // Upstream's `build_agent_system_prompt` takes the model so it can
@@ -325,7 +1939,7 @@ fn run_subagent_in_process(
         let system_prompt = build_agent_system_prompt(&subagent_type, &model_owned)?;
         let mut runtime =
             build_subagent_runtime(model_owned, allowed_tools, permission_mode, system_prompt)?
-                .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+                .with_max_iterations(max_iterations);
         let summary = runtime
             .run_turn(prompt, None)
             .map_err(|error| error.to_string())?;
@@ -554,7 +2168,10 @@ pub fn apply_provider_env(provider: &str, model: &str) -> ProviderEnvGuard {
     let _ = model; // model does not affect env mapping today
     match provider {
         "openrouter" => {
-            guard.set_if_absent("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+            guard.set_if_absent(
+                "OPENAI_BASE_URL",
+                "https://openrouter.ai/api/v1/chat/completions",
+            );
             if std::env::var_os("OPENAI_API_KEY").is_none() {
                 if let Some(key) = read_openrouter_key() {
                     guard.set_if_absent("OPENAI_API_KEY", &key);
@@ -825,7 +2442,7 @@ fn run_subagent_isolated(
         .arg("--dir")
         .arg(repo_dir)
         .arg("--plan")
-        .arg(&input.prompt);
+        .arg(prompt_with_review_controls(input));
     // Forward EXPLICIT caller overrides only. This is how an orchestrator dispatches a
     // budget-gated OpenRouter rung onto a preset whose default is local. When the caller
     // didn't specify, we leave them off so the launcher uses the preset's local-first
@@ -994,11 +2611,18 @@ mod tests {
         std::env::temp_dir().join(format!("claw-subagent-{tag}-{nanos}"))
     }
 
+    fn restore_env_var(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
     #[test]
     fn run_subagent_rejects_empty_prompt() {
         let output = run_subagent(RunSubagentInput {
             provider: Some("openrouter".to_string()),
-            model: Some("deepseek/deepseek-v4-pro".to_string()),
+            model: Some("deepseek/deepseek-v4-pro:nitro".to_string()),
             prompt: "   ".to_string(),
             repo_dir: None,
             subagent_type: None,
@@ -1007,6 +2631,11 @@ mod tests {
             timeout_secs: None,
             max_output_chars: None,
             preset: None,
+            review_depth: None,
+            focus: None,
+            artifact_scope: None,
+            stop_on_first_blocker: None,
+            require_evidence: None,
         });
         assert_eq!(output.status, "failed");
         assert!(output
@@ -1030,6 +2659,11 @@ mod tests {
             timeout_secs: None,
             max_output_chars: None,
             preset: None,
+            review_depth: None,
+            focus: None,
+            artifact_scope: None,
+            stop_on_first_blocker: None,
+            require_evidence: None,
         });
         assert_eq!(output.status, "failed");
         assert!(output
@@ -1052,6 +2686,11 @@ mod tests {
             timeout_secs: None,
             max_output_chars: None,
             preset: None,
+            review_depth: None,
+            focus: None,
+            artifact_scope: None,
+            stop_on_first_blocker: None,
+            require_evidence: None,
         });
         assert_eq!(output.status, "failed");
         assert!(output
@@ -1071,10 +2710,10 @@ mod tests {
         std::env::remove_var("CLAW_RESILIENCE");
 
         {
-            let _env = apply_provider_env("openrouter", "deepseek/deepseek-v4-pro");
+            let _env = apply_provider_env("openrouter", "deepseek/deepseek-v4-pro:nitro");
             assert_eq!(
                 std::env::var("OPENAI_BASE_URL").as_deref(),
-                Ok("https://openrouter.ai/api/v1")
+                Ok("https://openrouter.ai/api/v1/chat/completions")
             );
             assert_eq!(std::env::var("OPENAI_API_KEY").as_deref(), Ok("sk-or-test"));
             assert_eq!(std::env::var("CLAW_RESILIENCE").as_deref(), Ok("none"));
@@ -1125,6 +2764,45 @@ mod tests {
         let (short, truncated_short) = truncate_summary("hello", 20);
         assert!(!truncated_short);
         assert_eq!(short, "hello");
+    }
+
+    #[test]
+    fn review_depth_scales_internal_iteration_budget_without_public_iteration_flag() {
+        let input = RunSubagentInput {
+            provider: None,
+            model: None,
+            prompt: "review".to_string(),
+            repo_dir: None,
+            subagent_type: None,
+            permission_mode: None,
+            isolated: None,
+            timeout_secs: None,
+            max_output_chars: None,
+            preset: None,
+            review_depth: Some("deep".to_string()),
+            focus: None,
+            artifact_scope: None,
+            stop_on_first_blocker: None,
+            require_evidence: None,
+        };
+        assert_eq!(
+            max_iterations_for_input(&input),
+            DEFAULT_AGENT_MAX_ITERATIONS * 6
+        );
+
+        let mut exhaustive = input.clone();
+        exhaustive.review_depth = Some("exhaustive".to_string());
+        assert_eq!(
+            max_iterations_for_input(&exhaustive),
+            DEFAULT_AGENT_MAX_ITERATIONS * 12
+        );
+
+        let mut unknown = input;
+        unknown.review_depth = Some("surprise".to_string());
+        assert_eq!(
+            max_iterations_for_input(&unknown),
+            DEFAULT_AGENT_MAX_ITERATIONS
+        );
     }
 
     #[test]
@@ -1207,6 +2885,379 @@ mod tests {
         let result = handle_subagent_mcp_call("list_presets", &json!({})).expect("ok json");
         let value: Value = serde_json::from_str(&result).expect("valid json");
         assert!(value.is_array());
+    }
+
+    #[test]
+    fn start_subagent_rejects_empty_prompt_without_spawning() {
+        let result =
+            handle_subagent_mcp_call("start_subagent", &json!({ "prompt": " " })).expect("ok json");
+        let value: Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["status"], "failed");
+        assert!(value["status_command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("claw subagent status --status-file"));
+        assert!(value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("prompt must not be empty"));
+    }
+
+    #[test]
+    fn status_command_quotes_paths_with_spaces() {
+        let command = status_command_for_file(
+            Path::new("/tmp/claw runs/subagent-1/status.json"),
+            Path::new("/tmp/claw runs"),
+        );
+        assert_eq!(
+            command,
+            "CLAW_SUBAGENT_RUN_DIR='/tmp/claw runs' claw subagent status --status-file '/tmp/claw runs/subagent-1/status.json'"
+        );
+    }
+
+    #[test]
+    fn subagent_reaper_marks_active_status_failed_when_worker_exits() {
+        let _guard = env_guard();
+        let root = unique_dir("reaper-root");
+        let run_dir = root.join("subagent-reaper");
+        fs::create_dir_all(&run_dir).expect("mkdir status dir");
+        let status_file = run_dir.join("status.json");
+        let record = SubagentStatusRecord {
+            status: "running".to_string(),
+            phase: Some("running".to_string()),
+            run_id: "subagent-reaper".to_string(),
+            provider: "openrouter".to_string(),
+            model: "deepseek/deepseek-v4-pro:nitro".to_string(),
+            repo_dir: root.display().to_string(),
+            status_file: status_file.display().to_string(),
+            stdout_file: Some(run_dir.join("worker.stdout.log").display().to_string()),
+            stderr_file: Some(run_dir.join("worker.stderr.log").display().to_string()),
+            events_file: Some(run_dir.join("events.jsonl").display().to_string()),
+            pid: None,
+            started_at: (now_millis().saturating_sub(50)).to_string(),
+            updated_at: timestamp_now(),
+            last_activity_at: Some(timestamp_now()),
+            heartbeat_at: Some(timestamp_now()),
+            completed_at: None,
+            summary: String::new(),
+            truncated: false,
+            diff_stat: None,
+            error: None,
+            duration_ms: 0,
+            event_seq: 0,
+            read_paths: Vec::new(),
+            grep_patterns: Vec::new(),
+            web_queries: Vec::new(),
+            stop_command: None,
+            activity: Vec::new(),
+        };
+        write_status_record(&status_file, &record).expect("write status");
+
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "exit", "7"])
+            .spawn()
+            .expect("spawn short-lived child");
+        #[cfg(not(windows))]
+        let child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn short-lived child");
+
+        let pid = spawn_subagent_reaper(child, status_file.clone(), root.display().to_string());
+        assert!(pid > 0);
+
+        let mut final_status = String::new();
+        for _ in 0..50 {
+            let raw = fs::read_to_string(&status_file).expect("read status");
+            let value: Value = serde_json::from_str(&raw).expect("status json");
+            final_status = value["status"].as_str().unwrap_or_default().to_string();
+            if final_status == "failed" {
+                assert!(value["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("worker exited before writing a terminal status"));
+                assert!(value["completed_at"].is_string());
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = fs::remove_dir_all(root);
+        panic!("expected reaper to mark status failed, got {final_status}");
+    }
+
+    #[test]
+    fn get_subagent_reads_status_file_and_limits_activity() {
+        let _guard = env_guard();
+        let previous_run_dir = std::env::var_os("CLAW_SUBAGENT_RUN_DIR");
+        let root = unique_dir("status-root");
+        let dir = root.join("subagent-test");
+        fs::create_dir_all(&dir).expect("mkdir status dir");
+        std::env::set_var("CLAW_SUBAGENT_RUN_DIR", &root);
+        let status_file = dir.join("status.json");
+        let record = SubagentStatusRecord {
+            status: "running".to_string(),
+            phase: Some("running".to_string()),
+            run_id: "subagent-test".to_string(),
+            provider: "openrouter".to_string(),
+            model: "deepseek/deepseek-v4-pro:nitro".to_string(),
+            repo_dir: "/tmp/repo".to_string(),
+            status_file: status_file.display().to_string(),
+            stdout_file: None,
+            stderr_file: None,
+            events_file: Some(dir.join("events.jsonl").display().to_string()),
+            pid: None,
+            started_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            last_activity_at: Some("2".to_string()),
+            heartbeat_at: Some("2".to_string()),
+            completed_at: None,
+            summary: String::new(),
+            truncated: false,
+            diff_stat: None,
+            error: None,
+            duration_ms: 0,
+            event_seq: 2,
+            read_paths: vec!["src/lib.rs".to_string()],
+            grep_patterns: vec!["todo".to_string()],
+            web_queries: Vec::new(),
+            stop_command: None,
+            activity: vec![
+                SubagentActivity {
+                    seq: 1,
+                    tool_name: "read_file".to_string(),
+                    status: "completed".to_string(),
+                    input: json!({"path": "src/lib.rs"}),
+                    observed_target: Some("src/lib.rs".to_string()),
+                    started_at: "1".to_string(),
+                    finished_at: Some("2".to_string()),
+                    is_error: Some(false),
+                    output_chars: Some(10),
+                },
+                SubagentActivity {
+                    seq: 2,
+                    tool_name: "grep_search".to_string(),
+                    status: "running".to_string(),
+                    input: json!({"pattern": "todo"}),
+                    observed_target: Some("todo".to_string()),
+                    started_at: "3".to_string(),
+                    finished_at: None,
+                    is_error: None,
+                    output_chars: None,
+                },
+            ],
+        };
+        write_status_record(&status_file, &record).expect("write status");
+        let events = [
+            SubagentEvent {
+                seq: 1,
+                timestamp: "2".to_string(),
+                kind: "phase_started".to_string(),
+                phase: Some("running".to_string()),
+                status: None,
+                message: Some("started".to_string()),
+                tool_name: None,
+                observed_target: None,
+                input: None,
+                is_error: None,
+                output_chars: None,
+            },
+            SubagentEvent {
+                seq: 2,
+                timestamp: "3".to_string(),
+                kind: "tool_started".to_string(),
+                phase: Some("tool:grep_search".to_string()),
+                status: Some("running".to_string()),
+                message: Some("tool call started".to_string()),
+                tool_name: Some("grep_search".to_string()),
+                observed_target: Some("todo".to_string()),
+                input: Some(json!({"pattern": "todo"})),
+                is_error: None,
+                output_chars: None,
+            },
+        ];
+        let events_payload = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event json"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(dir.join("events.jsonl"), format!("{events_payload}\n")).expect("write events");
+        let value = get_subagent(GetSubagentInput {
+            run_id: None,
+            status_file: Some(status_file.display().to_string()),
+            activity_limit: Some(1),
+            event_limit: Some(1),
+            since_seq: Some(1),
+            stale_after_secs: None,
+        });
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["read_paths"][0], "src/lib.rs");
+        assert_eq!(value["activity"].as_array().expect("activity").len(), 1);
+        assert_eq!(value["activity"][0]["seq"], 2);
+        assert_eq!(value["event_count"], 2);
+        assert_eq!(value["events"].as_array().expect("events").len(), 1);
+        assert_eq!(value["events"][0]["seq"], 2);
+
+        restore_env_var("CLAW_SUBAGENT_RUN_DIR", previous_run_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn get_subagent_rejects_status_file_outside_run_root() {
+        let _guard = env_guard();
+        let previous_run_dir = std::env::var_os("CLAW_SUBAGENT_RUN_DIR");
+        let root = unique_dir("safe-status-root");
+        let outside = unique_dir("outside-status-root");
+        fs::create_dir_all(&root).expect("mkdir safe root");
+        fs::create_dir_all(&outside).expect("mkdir outside root");
+        let outside_status = outside.join("status.json");
+        fs::write(&outside_status, "{}").expect("write outside status");
+        std::env::set_var("CLAW_SUBAGENT_RUN_DIR", &root);
+
+        let value = get_subagent(GetSubagentInput {
+            run_id: None,
+            status_file: Some(outside_status.display().to_string()),
+            activity_limit: None,
+            event_limit: None,
+            since_seq: None,
+            stale_after_secs: None,
+        });
+
+        assert_eq!(value["status"], "failed");
+        assert!(value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("status_file must be under"));
+
+        restore_env_var("CLAW_SUBAGENT_RUN_DIR", previous_run_dir);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn get_subagent_marks_dead_active_worker_failed() {
+        let _guard = env_guard();
+        let previous_run_dir = std::env::var_os("CLAW_SUBAGENT_RUN_DIR");
+        let root = unique_dir("dead-worker-root");
+        let run_dir = root.join("subagent-dead-worker");
+        fs::create_dir_all(&run_dir).expect("mkdir status dir");
+        std::env::set_var("CLAW_SUBAGENT_RUN_DIR", &root);
+        let status_file = run_dir.join("status.json");
+        let record = SubagentStatusRecord {
+            status: "running".to_string(),
+            phase: Some("running".to_string()),
+            run_id: "subagent-dead-worker".to_string(),
+            provider: "openrouter".to_string(),
+            model: "deepseek/deepseek-v4-pro:nitro".to_string(),
+            repo_dir: root.display().to_string(),
+            status_file: status_file.display().to_string(),
+            stdout_file: Some(run_dir.join("worker.stdout.log").display().to_string()),
+            stderr_file: Some(run_dir.join("worker.stderr.log").display().to_string()),
+            events_file: Some(run_dir.join("events.jsonl").display().to_string()),
+            pid: Some(u32::MAX),
+            started_at: (now_millis().saturating_sub(50)).to_string(),
+            updated_at: timestamp_now(),
+            last_activity_at: Some(timestamp_now()),
+            heartbeat_at: Some(timestamp_now()),
+            completed_at: None,
+            summary: String::new(),
+            truncated: false,
+            diff_stat: None,
+            error: None,
+            duration_ms: 0,
+            event_seq: 0,
+            read_paths: Vec::new(),
+            grep_patterns: Vec::new(),
+            web_queries: Vec::new(),
+            stop_command: None,
+            activity: Vec::new(),
+        };
+        write_status_record(&status_file, &record).expect("write status");
+
+        let value = get_subagent(GetSubagentInput {
+            run_id: Some("subagent-dead-worker".to_string()),
+            status_file: None,
+            activity_limit: None,
+            event_limit: None,
+            since_seq: None,
+            stale_after_secs: None,
+        });
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["worker_alive"], false);
+        assert!(value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("worker exited"));
+
+        restore_env_var("CLAW_SUBAGENT_RUN_DIR", previous_run_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_subagent_marks_active_run_cancelled() {
+        let _guard = env_guard();
+        let previous_run_dir = std::env::var_os("CLAW_SUBAGENT_RUN_DIR");
+        let root = unique_dir("stop-root");
+        let run_dir = root.join("subagent-stop");
+        fs::create_dir_all(&run_dir).expect("mkdir status dir");
+        std::env::set_var("CLAW_SUBAGENT_RUN_DIR", &root);
+        let status_file = run_dir.join("status.json");
+        let now = timestamp_now();
+        let record = SubagentStatusRecord {
+            status: "running".to_string(),
+            phase: Some("model_turn".to_string()),
+            run_id: "subagent-stop".to_string(),
+            provider: "openrouter".to_string(),
+            model: "deepseek/deepseek-v4-pro:nitro".to_string(),
+            repo_dir: root.display().to_string(),
+            status_file: status_file.display().to_string(),
+            stdout_file: None,
+            stderr_file: None,
+            events_file: Some(run_dir.join("events.jsonl").display().to_string()),
+            pid: None,
+            started_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity_at: Some(now.clone()),
+            heartbeat_at: Some(now),
+            completed_at: None,
+            summary: String::new(),
+            truncated: false,
+            diff_stat: None,
+            error: None,
+            duration_ms: 0,
+            event_seq: 0,
+            activity: Vec::new(),
+            read_paths: Vec::new(),
+            grep_patterns: Vec::new(),
+            web_queries: Vec::new(),
+            stop_command: None,
+        };
+        write_status_record(&status_file, &record).expect("write status");
+
+        let value = stop_subagent(StopSubagentInput {
+            run_id: Some("subagent-stop".to_string()),
+            status_file: None,
+            grace_secs: Some(0),
+        });
+
+        assert_eq!(value["status"], "cancelled");
+        let status = get_subagent(GetSubagentInput {
+            run_id: None,
+            status_file: Some(status_file.display().to_string()),
+            activity_limit: None,
+            event_limit: Some(1),
+            since_seq: None,
+            stale_after_secs: None,
+        });
+        assert_eq!(status["status"], "cancelled");
+        assert_eq!(status["phase"], "cancelled");
+        assert_eq!(status["events"][0]["kind"], "terminal");
+
+        restore_env_var("CLAW_SUBAGENT_RUN_DIR", previous_run_dir);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

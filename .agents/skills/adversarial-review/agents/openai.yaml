@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Review"
+  short_description: "Independent read-only code review"
+  default_prompt: "Use $adversarial-review to review the current plan or diff before I finish."

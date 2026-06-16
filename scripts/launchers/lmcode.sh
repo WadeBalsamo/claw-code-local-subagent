@@ -59,12 +59,17 @@ add_to_recent() {
   fi
 }
 
+recent_addresses() {
+  [ -f "$RECENT_FILE" ] || return 0
+  awk 'NF { lines[NR]=$0 } END { for (i=NR; i>=1; i--) if (!seen[lines[i]]++) print lines[i] }' "$RECENT_FILE"
+}
+
 auto_probe() {
   if [ -f "$RECENT_FILE" ] && [ -s "$RECENT_FILE" ]; then
     while IFS= read -r addr; do
       [ -z "$addr" ] && continue
       if test_host_port "$addr"; then echo "$addr"; return 0; fi
-    done < <(tac "$RECENT_FILE" | awk '!seen[$0]++')
+    done < <(recent_addresses)
   fi
   for candidate in "127.0.0.1:${LM_STUDIO_PORT}" "localhost:${LM_STUDIO_PORT}"; do
     if test_host_port "$candidate"; then echo "$candidate"; return 0; fi
@@ -75,7 +80,9 @@ auto_probe() {
 interactive_select() {
   local options=()
   if [ -f "$RECENT_FILE" ] && [ -s "$RECENT_FILE" ]; then
-    mapfile -t options < <(tac "$RECENT_FILE" | awk '!seen[$0]++')
+    while IFS= read -r addr; do
+      options+=("$addr")
+    done < <(recent_addresses)
   fi
   while true; do
     if [ ${#options[@]} -gt 0 ]; then
@@ -105,7 +112,10 @@ interactive_select() {
           test_host_port "$selected" && { echo "$selected"; return 0; }
           echo "Connection failed for $selected. Removing." >&2
           tmpfile=$(mktemp); grep -vxF "$selected" "$RECENT_FILE" > "$tmpfile" || true; mv "$tmpfile" "$RECENT_FILE"
-          mapfile -t options < <(tac "$RECENT_FILE" 2>/dev/null | awk '!seen[$0]++' || true)
+          options=()
+          while IFS= read -r addr; do
+            options+=("$addr")
+          done < <(recent_addresses)
           continue
         fi
         echo "Invalid." >&2 ;;

@@ -127,7 +127,7 @@ Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
 
 ```powershell
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
-$env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+$env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 $env:OPENAI_API_KEY = "sk-or-v1-REPLACE_ME"
 
 .\target\debug\claw.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"

@@ -2,13 +2,13 @@
 #
 # Adversarial-review hook driver.
 #
-# Invoked by Claude Code's hooks (see .claude/settings.json):
+# Invoked by Codex project hooks (see .codex/hooks.json):
 #   - PostToolUse matcher ExitPlanMode  -> --mode plan          (review the plan)
 #   - Stop                              -> --mode implementation (review the diff)
 #
 # It runs a READ-ONLY claw-code sub-agent over OpenRouter to critique the
-# artifact and maps the reviewer's verdict to a Claude Code hook decision:
-# a `VERDICT: BLOCK` becomes {"decision":"block","reason":...} so Claude must
+# artifact and maps the reviewer's verdict to a hook decision:
+# a `VERDICT: BLOCK` becomes {"decision":"block","reason":...} so Codex must
 # address the findings before finishing; anything else lets Claude proceed.
 #
 # Design rule: FAIL OPEN, BUT LOUDLY. A missing key, offline reviewer, or parse
@@ -28,19 +28,33 @@
 # claw-code settings file under an `adversarialReview` object — see
 # docs/subagents.md. Precedence: env var > settings file > built-in default.
 #
-#   Settings keys (.claude/settings.json -> "adversarialReview"):
+#   Settings keys (.codex/settings.json -> "adversarialReview"):
 #     enabled                 set false to skip the review entirely (CLAW_REVIEW_FORCE overrides)
 #     model                   reviewer model
-#     timeoutSecs             hard wall-clock bound on the reviewer
+#     timeoutSecs             optional reviewer wall-clock bound; unset means no review timeout
+#     staleAfterSecs          seconds without activity before the poll output marks stale
+#     pollSecs                seconds between status polls
+#     reviewDepth             quick|standard|deep|exhaustive
+#     focus                   comma-separated review focus areas
+#     artifactScope           diff_only|diff_plus_tests|full_repo_context
+#     stopOnFirstBlocker      ask reviewer to stop after one concrete blocker
+#     requireEvidence         ask reviewer to cite concrete evidence
 #     contextMaxTokens        token cap on the context summarized + sent to the reviewer
 #     contextThresholdTokens  token count above which the conversation is summarized
 #     contextModel            model used for the conversation summary
 #     contextTimeoutSecs      timeout for the summary OpenRouter call
 #
 #   Env overrides:
-#     CLAW_REVIEW_MODEL / CLAW_SUBAGENT_MODEL   reviewer model (default deepseek/deepseek-v4-pro)
+#     CLAW_REVIEW_MODEL / CLAW_SUBAGENT_MODEL   reviewer model (default deepseek/deepseek-v4-pro:nitro)
 #     CLAW_BIN                                  path to the claw binary (default: claw on PATH)
-#     CLAW_REVIEW_TIMEOUT                       reviewer timeout, seconds (default 180)
+#     CLAW_REVIEW_TIMEOUT                       optional reviewer timeout, seconds (default unset)
+#     CLAW_REVIEW_STALE_AFTER                   stale threshold, seconds (default 300)
+#     CLAW_REVIEW_POLL_SECS                     status poll interval, seconds (default 15)
+#     CLAW_REVIEW_DEPTH                         review depth (default deep)
+#     CLAW_REVIEW_FOCUS                         review focus areas
+#     CLAW_REVIEW_ARTIFACT_SCOPE                review artifact scope
+#     CLAW_REVIEW_STOP_ON_FIRST_BLOCKER         true/false (default false)
+#     CLAW_REVIEW_REQUIRE_EVIDENCE              true/false (default true)
 #     OPENROUTER_API_KEY                        required; without it the review is skipped (fail open)
 #     CLAW_REVIEW_CONTEXT_MODEL                 model for the conversation summary
 #     CLAW_REVIEW_CONTEXT_THRESHOLD             context CHAR count above which we summarize (default 12000)
@@ -70,17 +84,26 @@ note() { printf 'adversarial-review: %s\n' "$1" >&2; }
 # --- Settings (claw-code config) --------------------------------------------
 # Read the `adversarialReview` block from the project's claw-code settings so
 # the reviewer + context budget are configurable WITHOUT env vars. Precedence
-# is: env var > settings file > built-in default. `.claude/settings.local.json`
-# (machine-local) overrides `.claude/settings.json` (shared). Token-based
+# is: env var > settings file > built-in default. `.codex/settings.local.json`
+# (machine-local) overrides `.codex/settings.json` (shared). Token-based
 # settings are converted to the script's internal char budget at ~4 chars/token.
 CHARS_PER_TOKEN=4
 AR_MODEL=""; AR_TIMEOUT=""; AR_CTX_MODEL=""; AR_CTX_TIMEOUT=""
 AR_CTX_MAX_TOKENS=""; AR_CTX_THRESHOLD_TOKENS=""; AR_ENABLED=""
+AR_STALE_AFTER=""; AR_POLL_SECS=""; AR_DEPTH=""; AR_FOCUS=""
+AR_ARTIFACT_SCOPE=""; AR_STOP_ON_FIRST_BLOCKER=""; AR_REQUIRE_EVIDENCE=""
 if [ -n "${PY:-}" ]; then
   while IFS='=' read -r _k _v; do
     case "$_k" in
       AR_MODEL) AR_MODEL="$_v" ;;
       AR_TIMEOUT) AR_TIMEOUT="$_v" ;;
+      AR_STALE_AFTER) AR_STALE_AFTER="$_v" ;;
+      AR_POLL_SECS) AR_POLL_SECS="$_v" ;;
+      AR_DEPTH) AR_DEPTH="$_v" ;;
+      AR_FOCUS) AR_FOCUS="$_v" ;;
+      AR_ARTIFACT_SCOPE) AR_ARTIFACT_SCOPE="$_v" ;;
+      AR_STOP_ON_FIRST_BLOCKER) AR_STOP_ON_FIRST_BLOCKER="$_v" ;;
+      AR_REQUIRE_EVIDENCE) AR_REQUIRE_EVIDENCE="$_v" ;;
       AR_CTX_MODEL) AR_CTX_MODEL="$_v" ;;
       AR_CTX_TIMEOUT) AR_CTX_TIMEOUT="$_v" ;;
       AR_CTX_MAX_TOKENS) AR_CTX_MAX_TOKENS="$_v" ;;
@@ -92,7 +115,12 @@ $(CC_REPO="$REPO_DIR" "$PY" - <<'PYEOF' 2>/dev/null || true
 import os, json
 repo = os.environ.get("CC_REPO", ".")
 cfg = {}
-for name in (".claude/settings.json", ".claude/settings.local.json"):
+for name in (
+    ".codex/settings.json",
+    ".codex/settings.local.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+):
     try:
         with open(os.path.join(repo, name)) as f:
             ar = json.load(f).get("adversarialReview")
@@ -102,6 +130,13 @@ for name in (".claude/settings.json", ".claude/settings.local.json"):
         pass
 keymap = {
     "model": "AR_MODEL", "timeoutSecs": "AR_TIMEOUT",
+    "staleAfterSecs": "AR_STALE_AFTER",
+    "pollSecs": "AR_POLL_SECS",
+    "reviewDepth": "AR_DEPTH",
+    "focus": "AR_FOCUS",
+    "artifactScope": "AR_ARTIFACT_SCOPE",
+    "stopOnFirstBlocker": "AR_STOP_ON_FIRST_BLOCKER",
+    "requireEvidence": "AR_REQUIRE_EVIDENCE",
     "contextModel": "AR_CTX_MODEL", "contextTimeoutSecs": "AR_CTX_TIMEOUT",
     "contextMaxTokens": "AR_CTX_MAX_TOKENS",
     "contextThresholdTokens": "AR_CTX_THRESHOLD_TOKENS",
@@ -122,8 +157,15 @@ EOF
 fi
 
 # Resolve effective config: env var > settings > default.
-REVIEW_MODEL="${CLAW_REVIEW_MODEL:-${CLAW_SUBAGENT_MODEL:-${AR_MODEL:-deepseek/deepseek-v4-pro}}}"
-REVIEW_TIMEOUT="${CLAW_REVIEW_TIMEOUT:-${AR_TIMEOUT:-180}}"
+REVIEW_MODEL="${CLAW_REVIEW_MODEL:-${CLAW_SUBAGENT_MODEL:-${AR_MODEL:-deepseek/deepseek-v4-pro:nitro}}}"
+REVIEW_TIMEOUT="${CLAW_REVIEW_TIMEOUT:-${AR_TIMEOUT:-}}"
+REVIEW_STALE_AFTER="${CLAW_REVIEW_STALE_AFTER:-${AR_STALE_AFTER:-300}}"
+REVIEW_POLL_SECS="${CLAW_REVIEW_POLL_SECS:-${AR_POLL_SECS:-15}}"
+REVIEW_DEPTH="${CLAW_REVIEW_DEPTH:-${AR_DEPTH:-deep}}"
+REVIEW_FOCUS="${CLAW_REVIEW_FOCUS:-${AR_FOCUS:-correctness,tests,security,scope}}"
+REVIEW_ARTIFACT_SCOPE="${CLAW_REVIEW_ARTIFACT_SCOPE:-${AR_ARTIFACT_SCOPE:-diff_plus_tests}}"
+REVIEW_STOP_ON_FIRST_BLOCKER="${CLAW_REVIEW_STOP_ON_FIRST_BLOCKER:-${AR_STOP_ON_FIRST_BLOCKER:-false}}"
+REVIEW_REQUIRE_EVIDENCE="${CLAW_REVIEW_REQUIRE_EVIDENCE:-${AR_REQUIRE_EVIDENCE:-true}}"
 CONTEXT_MODEL="${CLAW_REVIEW_CONTEXT_MODEL:-${AR_CTX_MODEL:-$REVIEW_MODEL}}"
 CONTEXT_TIMEOUT="${CLAW_REVIEW_CONTEXT_TIMEOUT:-${AR_CTX_TIMEOUT:-60}}"
 # Char budgets: explicit char env wins; else tokens-from-settings * chars/token;
@@ -138,6 +180,7 @@ else
     *) CONTEXT_MAX=$(( AR_CTX_MAX_TOKENS * CHARS_PER_TOKEN )) ;;
   esac
 fi
+
 if [ -n "${CLAW_REVIEW_CONTEXT_THRESHOLD:-}" ]; then
   CONTEXT_THRESHOLD="$CLAW_REVIEW_CONTEXT_THRESHOLD"
 else
@@ -153,8 +196,8 @@ if [ "$AR_ENABLED" = "false" ] && [ -z "${CLAW_REVIEW_FORCE:-}" ]; then
   exit 0
 fi
 
-# FAIL OPEN, but LOUDLY. A missing key / offline reviewer / timeout must never
-# hard-block the session, but it must also never be mistaken for a clean review.
+# FAIL OPEN, but LOUDLY. A missing key / offline reviewer / explicit timeout
+# must never hard-block the session, but it must also never be mistaken for a clean review.
 # We emit a banner to stderr and, when python is available, a `systemMessage` on
 # stdout so the skip surfaces to the user and the model (not just buried logs).
 fail_open() {
@@ -175,6 +218,17 @@ PYEOF
 command -v "$CLAW_BIN" >/dev/null 2>&1 || fail_open "claw binary '$CLAW_BIN' not found"
 [ -n "$PY" ] || fail_open "python3 not found"
 [ -n "${OPENROUTER_API_KEY:-}" ] || fail_open "OPENROUTER_API_KEY not set"
+
+case "$REVIEW_TIMEOUT" in
+  ""|*[!0-9]*) [ -z "$REVIEW_TIMEOUT" ] || fail_open "invalid reviewer timeout '${REVIEW_TIMEOUT}'" ;;
+  0) fail_open "invalid reviewer timeout '0'" ;;
+esac
+case "$REVIEW_STALE_AFTER" in
+  ""|*[!0-9]*|0) REVIEW_STALE_AFTER=300 ;;
+esac
+case "$REVIEW_POLL_SECS" in
+  ""|*[!0-9]*|0) REVIEW_POLL_SECS=15 ;;
+esac
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -225,14 +279,25 @@ ${DIFF}"
 fi
 
 # --- The adversarial rubric --------------------------------------------------
-# Single canonical source: .claude/skills/adversarial-review/rubric.md. SKILL.md
-# and the preset's system_prompt mirror that file; this driver reads it directly
-# so the hook path can never silently drift from the canonical text.
-RUBRIC_FILE="$SCRIPT_DIR/../.claude/skills/adversarial-review/rubric.md"
-if [ -r "$RUBRIC_FILE" ]; then
+# Single canonical repo source: .agents/skills/adversarial-review/rubric.md.
+# User-level Codex and legacy Claude installs are accepted as fallbacks so the
+# same driver remains usable outside this repository.
+RUBRIC_FILE=""
+for _rubric in \
+  "$SCRIPT_DIR/../.agents/skills/adversarial-review/rubric.md" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/adversarial-review/rubric.md" \
+  "$SCRIPT_DIR/../.claude/skills/adversarial-review/rubric.md" \
+  "$HOME/.claude/skills/adversarial-review/rubric.md"
+do
+  if [ -r "$_rubric" ]; then
+    RUBRIC_FILE="$_rubric"
+    break
+  fi
+done
+if [ -n "$RUBRIC_FILE" ]; then
   RUBRIC="$(cat "$RUBRIC_FILE")"
 else
-  fail_open "rubric file not found at $RUBRIC_FILE"
+  fail_open "rubric file not found in .agents, user Codex skills, or legacy Claude skills"
 fi
 
 # --- User intent + conversation context --------------------------------------
@@ -310,7 +375,7 @@ convo = "\n\n".join("[%s] %s" % (r, t) for r, t in msgs)
 summary = ""
 if len(convo) > threshold and api_key and model:
     sys_prompt = (
-        "Summarize this Claude Code coding session into a brief for an "
+        "Summarize this Codex coding session into a brief for an "
         "independent code reviewer. Capture: the user's original goal and any "
         "explicit constraints, the key decisions and trade-offs made, what was "
         "actually built/changed (file by file where it matters), and any open "
@@ -376,46 +441,149 @@ ${ARTIFACT}"
 fi
 
 # --- Run the read-only reviewer ----------------------------------------------
-# Hard-bound the call: the restored resilience layer retries failed network
-# calls with backoff, so an unreachable/misconfigured endpoint must not stall
-# the session. `timeout` exit 124 is treated as a fail-open skip.
-TIMEOUT_BIN="$(command -v timeout || true)"
-reviewer() {
-  if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$REVIEW_TIMEOUT" "$CLAW_BIN" subagent run "$@"
-  else
-    "$CLAW_BIN" subagent run "$@"
-  fi
-}
-printf '%s' "$PROMPT" | reviewer \
-  --provider openrouter \
-  --permission-mode read-only \
-  --subagent-type Explore \
-  --model "$REVIEW_MODEL" \
-  --repo-dir "$REPO_DIR" \
-  --timeout-secs "$REVIEW_TIMEOUT" \
-  --max-output-chars 8000 \
-  > "$TMP/result.json" 2> "$TMP/err"
+# Reviews can legitimately take 15-20 minutes. Start the reviewer as a
+# pollable sub-agent, surface liveness/staleness each poll, and only apply a
+# timeout when the caller explicitly configured one.
+printf '%s' "$PROMPT" > "$TMP/prompt.txt"
+
+START_ARGS=(
+  subagent start
+  --provider openrouter
+  --permission-mode read-only
+  --subagent-type Explore
+  --model "$REVIEW_MODEL"
+  --repo-dir "$REPO_DIR"
+  --max-output-chars 8000
+  --review-depth "$REVIEW_DEPTH"
+  --focus "$REVIEW_FOCUS"
+  --artifact-scope "$REVIEW_ARTIFACT_SCOPE"
+)
+if [ -n "$REVIEW_TIMEOUT" ]; then
+  START_ARGS+=(--timeout-secs "$REVIEW_TIMEOUT")
+fi
+if [ "$REVIEW_STOP_ON_FIRST_BLOCKER" = "true" ]; then
+  START_ARGS+=(--stop-on-first-blocker)
+fi
+if [ "$REVIEW_REQUIRE_EVIDENCE" = "true" ]; then
+  START_ARGS+=(--require-evidence)
+fi
+
+"$CLAW_BIN" "${START_ARGS[@]}" < "$TMP/prompt.txt" > "$TMP/start.json" 2> "$TMP/err"
 rc=$?
 if [ "$rc" != "0" ]; then
-  if [ "$rc" = "124" ]; then
-    fail_open "reviewer timed out after ${REVIEW_TIMEOUT}s"
-  fi
-  fail_open "reviewer invocation failed: $(head -c 200 "$TMP/err" 2>/dev/null)"
+  fail_open "reviewer start failed: $(head -c 200 "$TMP/err" 2>/dev/null)"
 fi
 
-STATUS="$("$PY" - "$TMP/result.json" <<'PYEOF'
+START_STATUS=""; STATUS_FILE=""; RUN_ID=""; STATUS_COMMAND=""; STOP_COMMAND=""
+while IFS='=' read -r _k _v; do
+  case "$_k" in
+    START_STATUS) START_STATUS="$_v" ;;
+    STATUS_FILE) STATUS_FILE="$_v" ;;
+    RUN_ID) RUN_ID="$_v" ;;
+    STATUS_COMMAND) STATUS_COMMAND="$_v" ;;
+    STOP_COMMAND) STOP_COMMAND="$_v" ;;
+  esac
+done <<EOF
+$("$PY" - "$TMP/start.json" <<'PYEOF'
 import sys, json
 try:
-    print(json.load(open(sys.argv[1])).get("status", ""))
+    data = json.load(open(sys.argv[1]))
 except Exception:
-    print("")
+    data = {}
+for key, name in [
+    ("status", "START_STATUS"),
+    ("status_file", "STATUS_FILE"),
+    ("run_id", "RUN_ID"),
+    ("status_command", "STATUS_COMMAND"),
+    ("stop_command", "STOP_COMMAND"),
+]:
+    value = data.get(key) or ""
+    print("%s=%s" % (name, value))
 PYEOF
-)"
+)
+EOF
 
-if [ "$STATUS" != "completed" ]; then
-  fail_open "reviewer did not complete (status=${STATUS:-unknown})"
+if [ "$START_STATUS" != "started" ] || [ -z "$STATUS_FILE" ]; then
+  fail_open "reviewer did not start (status=${START_STATUS:-unknown})"
 fi
+note "reviewer started run_id=${RUN_ID:-unknown}"
+[ -z "$STATUS_COMMAND" ] || note "poll with: $STATUS_COMMAND"
+[ -z "$STOP_COMMAND" ] || note "cancel with: $STOP_COMMAND"
+
+while :; do
+  "$CLAW_BIN" subagent status \
+    --status-file "$STATUS_FILE" \
+    --activity-limit 20 \
+    --event-limit 20 \
+    --stale-after-secs "$REVIEW_STALE_AFTER" \
+    > "$TMP/result.json" 2> "$TMP/err"
+  rc=$?
+  if [ "$rc" != "0" ]; then
+    fail_open "reviewer status poll failed: $(head -c 200 "$TMP/err" 2>/dev/null)"
+  fi
+
+  STATUS=""; PHASE=""; STALE=""; WORKER_ALIVE=""; EVENT_COUNT=""; STALE_REASON=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      STATUS) STATUS="$_v" ;;
+      PHASE) PHASE="$_v" ;;
+      STALE) STALE="$_v" ;;
+      WORKER_ALIVE) WORKER_ALIVE="$_v" ;;
+      EVENT_COUNT) EVENT_COUNT="$_v" ;;
+      STALE_REASON) STALE_REASON="$_v" ;;
+      STATUS_COMMAND) STATUS_COMMAND="$_v" ;;
+      STOP_COMMAND) STOP_COMMAND="$_v" ;;
+    esac
+  done <<EOF
+$("$PY" - "$TMP/result.json" <<'PYEOF'
+import sys, json
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = {}
+def val(name):
+    v = data.get(name)
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+for key, name in [
+    ("status", "STATUS"),
+    ("phase", "PHASE"),
+    ("stale", "STALE"),
+    ("worker_alive", "WORKER_ALIVE"),
+    ("event_count", "EVENT_COUNT"),
+    ("stale_reason", "STALE_REASON"),
+    ("status_command", "STATUS_COMMAND"),
+    ("stop_command", "STOP_COMMAND"),
+]:
+    print("%s=%s" % (name, val(key)))
+PYEOF
+)
+EOF
+
+  note "reviewer status=${STATUS:-unknown} phase=${PHASE:-unknown} worker_alive=${WORKER_ALIVE:-unknown} stale=${STALE:-false} events=${EVENT_COUNT:-0}"
+  if [ "$STALE" = "true" ]; then
+    note "${STALE_REASON:-reviewer has not reported recent activity}"
+    [ -z "$STOP_COMMAND" ] || note "cancel if frozen: $STOP_COMMAND"
+  fi
+
+  case "$STATUS" in
+    completed)
+      break
+      ;;
+    failed|timeout|cancelled|missing)
+      fail_open "reviewer did not complete (status=${STATUS:-unknown})"
+      ;;
+    starting|running|"")
+      sleep "$REVIEW_POLL_SECS"
+      ;;
+    *)
+      fail_open "reviewer returned unknown status '${STATUS}'"
+      ;;
+  esac
+done
 
 # --- Map the verdict to a hook decision --------------------------------------
 # Block ONLY on an explicit "VERDICT: BLOCK". A truncated/missing verdict fails

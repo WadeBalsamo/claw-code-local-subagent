@@ -252,7 +252,7 @@ claw setup openrouter  [model] [--set-key KEY] [--list-models]
   `localhost:1234`, configured host:port), fetches the loaded model list, and
   sets `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `CLAW_RESILIENCE=force`.
 - `claw setup openrouter` manages the API key (see config dir below), fetches the
-  tool-capable model catalog, and sets `OPENAI_BASE_URL=https://openrouter.ai/api/v1`
+  tool-capable model catalog, and sets `OPENAI_BASE_URL=https://openrouter.ai/api/v1/chat/completions`
   with `CLAW_RESILIENCE=none`.
 
 ### Standalone launchers (`~/.local/bin`)
@@ -263,7 +263,7 @@ claw setup openrouter  [model] [--set-key KEY] [--list-models]
 |---|---|---|
 | `lmcode` | LM Studio (auto-discovery, model list) | `OPENAI_BASE_URL=http://<host>:<port>/v1`, `CLAW_RESILIENCE=force` |
 | `ollamacode` | Ollama (server lifecycle, model TUI, context detection) | `OPENAI_BASE_URL=http://<host>:<port>/v1`, `CLAW_RESILIENCE=force` |
-| `openroutercode` | OpenRouter (tool-capable model browser) | `OPENAI_BASE_URL=https://openrouter.ai/api/v1`, `CLAW_RESILIENCE=none` |
+| `openroutercode` | OpenRouter (tool-capable model browser) | `OPENAI_BASE_URL=https://openrouter.ai/api/v1/chat/completions`, `CLAW_RESILIENCE=none` |
 
 Example:
 
@@ -291,15 +291,18 @@ without re-entry.
 
 ## `claw mcp serve` sub-agent tools
 
-`claw mcp serve` runs a stdio MCP server exposing a purpose-built pair of tools —
-`run_subagent` and `list_presets` — so a parent agent (Claude Code, openclaw, or
-any MCP client) can spawn a local or OpenRouter sub-agent and get a single
-bounded result back instead of the whole raw toolbox.
+`claw mcp serve` runs a stdio MCP server exposing a purpose-built sub-agent
+surface — `run_subagent`, `start_subagent`, `get_subagent`, and `list_presets` —
+so a parent agent (Claude Code, openclaw, or any MCP client) can spawn a local or
+OpenRouter sub-agent and get bounded artifacts back instead of the whole raw
+toolbox. Use `run_subagent` for a single inline result; use `start_subagent` and
+poll `get_subagent` for long work where the parent needs status, activity, and
+observed read paths.
 
 `run_subagent` takes a `provider`
 (`local|openrouter|ollama|lmstudio|anthropic|openai|auto`) and an optional
 `model`. With no `model` it defaults to a **DeepSeek** model via OpenRouter
-(`CLAW_SUBAGENT_MODEL`, then the built-in `deepseek/deepseek-v4-pro` default);
+(`CLAW_SUBAGENT_MODEL`, then the built-in `deepseek/deepseek-v4-pro:nitro` default);
 `provider=local|ollama|lmstudio` requires the local server running **and** an
 explicit `model` (there is no local default). See the README's
 "Using claw as an MCP sub-agent server" section for the full tool contract.

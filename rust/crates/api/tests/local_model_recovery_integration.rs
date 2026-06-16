@@ -186,11 +186,10 @@ fn recovery_sequence_models_realistic_scenario() {
 
     // Verify health profile updated
     assert!(
-        state_machine
+        !state_machine
             .context()
             .health_profile
             .last_success_streaming
-            == false
     );
 }
 

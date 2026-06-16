@@ -590,21 +590,32 @@ fn http_checks_print(embeddings_check: bool) {
 }
 
 fn openai_models_url(base: &str) -> String {
-    let b = base.trim().trim_end_matches('/');
-    if b.ends_with("/v1") {
-        format!("{b}/models")
-    } else {
-        format!("{b}/v1/models")
-    }
+    format!("{}/models", openai_v1_base(base))
 }
 
 fn openai_embeddings_url(base: &str) -> String {
+    format!("{}/embeddings", openai_v1_base(base))
+}
+
+fn openai_v1_base(base: &str) -> String {
     let b = base.trim().trim_end_matches('/');
-    if b.ends_with("/v1") {
-        format!("{b}/embeddings")
+    if let Some(pos) = find_v1_path_segment(b) {
+        b[..pos + 3].to_string()
     } else {
-        format!("{b}/v1/embeddings")
+        format!("{b}/v1")
     }
+}
+
+fn find_v1_path_segment(value: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(relative) = value[offset..].find("/v1") {
+        let pos = offset + relative;
+        match value.as_bytes().get(pos + 3) {
+            None | Some(b'/') => return Some(pos),
+            _ => offset = pos + 3,
+        }
+    }
+    None
 }
 
 fn anthropic_models_url(base: &str) -> String {
@@ -728,6 +739,43 @@ mod tests {
         assert_eq!(
             parse_host_port("https://api.anthropic.com").unwrap(),
             ("api.anthropic.com".into(), 443)
+        );
+    }
+
+    #[test]
+    fn openai_probe_urls_truncate_full_chat_completion_endpoint_at_v1() {
+        let base = "https://openrouter.ai/api/v1/chat/completions";
+        assert_eq!(
+            openai_models_url(base),
+            "https://openrouter.ai/api/v1/models"
+        );
+        assert_eq!(
+            openai_embeddings_url(base),
+            "https://openrouter.ai/api/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn openai_probe_urls_accept_base_urls_with_or_without_v1() {
+        assert_eq!(
+            openai_models_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            openai_embeddings_url("http://localhost:1234"),
+            "http://localhost:1234/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn openai_probe_urls_do_not_truncate_v1_prefix_inside_larger_segment() {
+        assert_eq!(
+            openai_models_url("https://example.test/api/v10"),
+            "https://example.test/api/v10/v1/models"
+        );
+        assert_eq!(
+            openai_embeddings_url("https://example.test/api/v1beta"),
+            "https://example.test/api/v1beta/v1/embeddings"
         );
     }
 }

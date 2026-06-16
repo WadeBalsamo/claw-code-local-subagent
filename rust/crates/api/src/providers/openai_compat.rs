@@ -3220,7 +3220,7 @@ mod tests {
             super::wire_model_for_base_url(
                 "openai/gpt-4.1-mini",
                 OpenAiCompatConfig::openai(),
-                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/chat/completions",
             ),
             Cow::Borrowed("openai/gpt-4.1-mini")
         );

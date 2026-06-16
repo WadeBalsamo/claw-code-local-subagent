@@ -26,12 +26,23 @@ cargo build --workspace
 
 ## Install / build the workspace
 
+The recommended path builds the workspace **and** installs `claw` (plus the `lmcode` /
+`ollamacode` / `openroutercode` / `run-claw-code` shims) into `~/.local/bin`:
+
+```bash
+./install.sh --release       # from the repo root; omit --release for a faster debug build
+claw --version               # ensure ~/.local/bin is on your PATH
+```
+
+To build the workspace in place without installing the launchers (e.g. for development):
+
 ```bash
 cd rust
 cargo build --workspace
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build. Make the doctor check above your first post-build step.
+The CLI binary is then available at `rust/target/debug/claw` (or `target/release/claw` with
+`--release`). Make the doctor check above your first post-build step.
 
 ## Quick start
 
@@ -224,11 +235,15 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 |---|---|---|---|
 | `sk-ant-*` API key | `ANTHROPIC_API_KEY` | `x-api-key: sk-ant-...` | [console.anthropic.com](https://console.anthropic.com) |
 | OAuth access token (opaque) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | an Anthropic-compatible proxy or OAuth flow that mints bearer tokens |
-| OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1/chat/completions` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
 
 **Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.
 
 **If you meant a different provider:** if `claw` reports missing Anthropic credentials but you already have `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` exported, you most likely forgot to prefix the model name with the provider's routing prefix. Use `--model openai/gpt-4.1-mini` (OpenAI-compat / OpenRouter / Ollama), `--model grok` (xAI), or `--model qwen-plus` (DashScope) and the prefix router will select the right backend regardless of the ambient credentials. The error message now includes a hint that names the detected env var.
+
+**Persisting a provider (durable default).** Beyond env vars, `claw setup` (the interactive wizard) saves your provider + model to `~/.claw/settings.json` (`0600`) so the REPL defaults to it. For OpenRouter the persisted block is `{"provider":{"kind":"openai","apiKey":"sk-or-…","baseUrl":"https://openrouter.ai/api/v1/chat/completions"},"model":"…"}`; write that file directly for non-interactive setups. (The `claw setup openrouter [model]` shortcut configures and launches a session but does **not** persist — only the bare `claw setup` wizard persists.)
+
+**`claw doctor` Auth caveat.** The doctor **Auth** check inspects only `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `OPENAI_API_KEY`. It does **not** read `OPENROUTER_API_KEY` or the `provider.apiKey` persisted in `~/.claw/settings.json`, so an OpenRouter-only setup shows a harmless "no supported auth env vars were found" warning (0 failures). Confirm auth with a real call rather than the doctor banner — e.g. `echo ping | claw subagent run --provider openrouter --permission-mode read-only --subagent-type Explore` returns `status: "completed"` when the key works.
 
 ## Local Models
 
@@ -267,7 +282,7 @@ cd rust
 ### OpenRouter
 
 ```bash
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1/chat/completions"
 export OPENAI_API_KEY="sk-or-v1-..."
 
 cd rust

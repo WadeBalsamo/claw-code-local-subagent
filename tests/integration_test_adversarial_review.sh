@@ -27,22 +27,32 @@ fi
 # a plan-mode hook payload. Echoes the work dir. $1 = settings.json contents.
 stage() {
   local work; work="$(mktemp -d)"
-  mkdir -p "$work/scripts" "$work/.claude/skills/adversarial-review" "$work/bin"
+  mkdir -p "$work/scripts" "$work/.agents/skills/adversarial-review" "$work/.codex" "$work/bin"
   cp "$DRIVER" "$work/scripts/adversarial_review.sh"
-  cp "$REPO_ROOT/.claude/skills/adversarial-review/rubric.md" \
-     "$work/.claude/skills/adversarial-review/rubric.md"
+  cp "$REPO_ROOT/.agents/skills/adversarial-review/rubric.md" \
+     "$work/.agents/skills/adversarial-review/rubric.md"
   git -C "$work" init -q
-  printf '%s' "$1" > "$work/.claude/settings.json"
+  printf '%s' "$1" > "$work/.codex/settings.json"
   printf '{"type":"user","message":{"role":"user","content":"ADD_RETRY_LOGIC_MARKER"}}\n' \
     > "$work/transcript.jsonl"
   printf '{"tool_input":{"plan":"PLAN_MARKER"},"transcript_path":"%s/transcript.jsonl"}' \
     "$work" > "$work/payload.json"
-  # Stub claw: record argv + the prompt it received, then return a PASS verdict.
+  # Stub claw: emulate start/status so the driver exercises the pollable path.
   {
     printf '#!/usr/bin/env bash\n'
-    printf 'echo "$*" > "%s/args.txt"\n' "$work"
-    printf 'cat > "%s/prompt.txt"\n' "$work"
-    printf 'printf "%%s" "{\\"status\\":\\"completed\\",\\"summary\\":\\"VERDICT: PASS\\",\\"model\\":\\"x\\",\\"provider\\":\\"openrouter\\"}"\n'
+    printf 'if [ "$1" = "subagent" ] && [ "$2" = "start" ]; then\n'
+    printf '  echo "$*" > "%s/args.txt"\n' "$work"
+    printf '  cat > "%s/prompt.txt"\n' "$work"
+    printf '  printf "%%s" "{\\"status\\":\\"started\\",\\"run_id\\":\\"stub-run\\",\\"status_file\\":\\"%s/status.json\\",\\"status_command\\":\\"claw subagent status --status-file %s/status.json\\",\\"stop_command\\":\\"claw subagent stop --status-file %s/status.json\\"}"\n' "$work" "$work" "$work"
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'if [ "$1" = "subagent" ] && [ "$2" = "status" ]; then\n'
+    printf '  echo "$*" > "%s/status_args.txt"\n' "$work"
+    printf '  printf "%%s" "{\\"status\\":\\"completed\\",\\"phase\\":\\"completed\\",\\"stale\\":false,\\"worker_alive\\":false,\\"event_count\\":2,\\"summary\\":\\"VERDICT: PASS\\",\\"model\\":\\"x\\",\\"provider\\":\\"openrouter\\"}"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'echo "unexpected claw invocation: $*" >&2\n'
+    printf 'exit 2\n'
   } > "$work/bin/claw"
   chmod +x "$work/bin/claw"
   echo "$work"
@@ -71,6 +81,14 @@ W=$(stage '{"adversarialReview":{"model":"deepseek/from-settings","timeoutSecs":
 grep -q -- "--model deepseek/from-settings" "$W/args.txt"; m=$?
 grep -q -- "--timeout-secs 99" "$W/args.txt"; t=$?
 [ $m -eq 0 ] && [ $t -eq 0 ]; assert $? "model + timeoutSecs read from settings"
+rm -rf "$W"
+
+log_test "Default reviewer path uses start/status and no timeout"
+W=$(stage '{}'); run_driver "$W" >/dev/null
+grep -q -- "subagent start" "$W/args.txt"; start=$?
+test -f "$W/status_args.txt"; status=$?
+grep -q -- "--timeout-secs" "$W/args.txt"; timeout=$?
+[ $start -eq 0 ] && [ $status -eq 0 ] && [ $timeout -ne 0 ]; assert $? "pollable path used without default timeout"
 rm -rf "$W"
 
 log_test "Env var overrides settings (precedence)"

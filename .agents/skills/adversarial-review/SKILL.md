@@ -5,17 +5,18 @@ description: Get an independent, adversarial second opinion on a plan or impleme
 
 # Adversarial review (claw-code as a read-only second opinion)
 
-You (Claude Code) are the master. This skill delegates an **adversarial review** to a
+You (Codex) are the master. This skill delegates an **adversarial review** to a
 separate, disinterested model running as a **read-only** claw-code sub-agent over OpenRouter.
 Because the reviewer has no stake in the plan and re-derives its critique from the raw plan/diff,
 it catches the failure modes a self-review tends to rationalize: inert code, false-green tests,
 and silent scope creep.
 
-The canonical review rubric lives in `.claude/skills/adversarial-review/rubric.md` — both this skill
-and the hook driver (`scripts/adversarial_review.sh`) feed that one file to the reviewer, so there is
-a single source of truth. The same review also runs automatically via the `Stop` and
-`PostToolUse(ExitPlanMode)` hooks in `.claude/settings.json`; invoke this skill directly when you want
-a deeper or ad-hoc review, or to re-review after addressing findings.
+The review rubric is bundled next to this file as `rubric.md`. Read that file from the resolved
+skill directory and use it verbatim. In this repo the source path is
+`.agents/skills/adversarial-review/rubric.md`; after a user-level Codex install it is usually
+`${CODEX_HOME:-~/.codex}/skills/adversarial-review/rubric.md`. The repo hook driver reads the
+project copy first, then the user-level Codex copy, then legacy Claude skill locations for
+compatibility.
 
 ## When to run it
 
@@ -29,9 +30,9 @@ Call the MCP tool `mcp__claw-subagents__run_subagent` with a read-only Explore s
 quick synchronous review. For a long or recursive review, call
 `mcp__claw-subagents__start_subagent` with the same payload, then poll
 `mcp__claw-subagents__get_subagent` with the returned `run_id` or `status_file`. Build the prompt
-from the canonical rubric (read `.claude/skills/adversarial-review/rubric.md` and use it verbatim),
-then the **user's original request and a short context summary**, then the artifact under review
-(the plan text, or the diff):
+from the bundled rubric (read `rubric.md` next to this `SKILL.md` and use it verbatim), then the
+**user's original request and a short context summary**, then the artifact under review (the plan
+text, or the diff):
 
 ```json
 {
@@ -71,8 +72,11 @@ Notes:
   `PermissionEnforcer` policy on top. There is no edit/write/bash-mutation path. A non-empty
   `diff_stat` in the result would indicate the reviewer changed something; it should always be empty.
 - **Model selection**: for a direct MCP call, an explicit `model` wins, else `CLAW_SUBAGENT_MODEL`,
-  else the default `deepseek/deepseek-v4-pro:nitro`. The hook driver additionally honors `CLAW_REVIEW_MODEL`,
-  which takes precedence over `CLAW_SUBAGENT_MODEL`. All resolve against OpenRouter.
+  else the default `deepseek/deepseek-v4-pro:nitro` OpenRouter Nitro route. The hook driver
+  additionally honors `CLAW_REVIEW_MODEL`, which takes precedence over `CLAW_SUBAGENT_MODEL`.
+  All resolve against OpenRouter.
+- **OpenRouter endpoint**: use `OPENAI_BASE_URL=https://openrouter.ai/api/v1/chat/completions`
+  with model slug `deepseek/deepseek-v4-pro:nitro`.
 - **Recursive/deep reviews**: use `start_subagent` plus `get_subagent` polling instead of adding a
   short wall-clock timeout. `get_subagent` reports the current `status`, `phase`, `pid`,
   best-effort `worker_alive`, `stale`, recent JSONL `events`, observed `activity`, `read_paths`,
@@ -84,16 +88,16 @@ Notes:
 
 ## The review rubric (put this in the `prompt`)
 
-The rubric is maintained as a single canonical file:
-**`.claude/skills/adversarial-review/rubric.md`**. Read that file and use its contents verbatim as
-the prefix of the `prompt`, followed by the artifact under review. Don't paraphrase or restate it
-here — one copy keeps this skill, the hook driver, and the preset from drifting apart.
+The rubric is maintained as the bundled `rubric.md` file next to this `SKILL.md`. Read that file
+and use its contents verbatim as the prefix of the `prompt`, followed by the artifact under review.
+Don't paraphrase or restate it here.
 
 ## Automatic enforcement (hooks)
 
-This review also runs **automatically**, even if you never invoke the skill:
-- `PostToolUse(ExitPlanMode)` reviews the plan; `Stop` reviews the working-tree diff. Both are wired
-  in `.claude/settings.json` and driven by `scripts/adversarial_review.sh`.
+This repo can also run the same review **automatically**, even if you never invoke the skill:
+- `PostToolUse(ExitPlanMode)` reviews the plan; `Stop` reviews the working-tree diff. The Codex
+  hook configuration is project-scoped in `.codex/hooks.json` and driven by
+  `scripts/adversarial_review.sh`; installing this skill user-level does not install those hooks.
 - A `VERDICT: BLOCK` is **enforced**: the hook returns `{"decision":"block"}`, so you cannot finish
   until the findings are addressed (or rebutted with evidence) and a re-review returns `VERDICT: PASS`.
 - Each run is a **real OpenRouter API call** (cost + latency). The automatic hook uses the

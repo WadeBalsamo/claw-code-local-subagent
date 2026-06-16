@@ -34,7 +34,7 @@ mod args;
 mod install;
 mod setup;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -1556,6 +1556,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut index = 0;
 
     while index < args.len() {
+        if rest.first().is_some_and(|command| command == "subagent") {
+            rest.push(args[index].clone());
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--help" | "-h" if rest.is_empty() => {
                 wants_help = true;
@@ -1990,9 +1995,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
-                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+            return Err("invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact".to_string());
         }
     }
 
@@ -3284,8 +3287,92 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
+fn set_env_if_missing(key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        if env::var_os(key).is_none() {
+            env::set_var(key, value);
+        }
+    }
+}
+
+fn apply_provider_env_from_config(provider: &runtime::RuntimeProviderConfig) {
+    match provider.kind().unwrap_or_default() {
+        "anthropic" => {
+            set_env_if_missing("ANTHROPIC_API_KEY", provider.api_key());
+            set_env_if_missing("ANTHROPIC_BASE_URL", provider.base_url());
+            set_env_if_missing("CLAW_RESILIENCE", Some("none"));
+        }
+        "xai" => {
+            set_env_if_missing("XAI_API_KEY", provider.api_key());
+            set_env_if_missing("XAI_BASE_URL", provider.base_url());
+            set_env_if_missing("CLAW_RESILIENCE", Some("none"));
+        }
+        "dashscope" => {
+            set_env_if_missing("DASHSCOPE_API_KEY", provider.api_key());
+            set_env_if_missing("DASHSCOPE_BASE_URL", provider.base_url());
+            set_env_if_missing("CLAW_RESILIENCE", Some("none"));
+        }
+        "openai" => {
+            set_env_if_missing("OPENAI_API_KEY", provider.api_key());
+            set_env_if_missing("OPENAI_BASE_URL", provider.base_url());
+            if provider
+                .base_url()
+                .is_some_and(|url| url.contains("127.0.0.1") || url.contains("localhost"))
+            {
+                set_env_if_missing("CLAW_RESILIENCE", Some("force"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_configured_provider_env_for_current_dir() {
+    let Some(cwd) = env::current_dir().ok() else {
+        return;
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(config) = loader.load() else {
+        return;
+    };
+    apply_provider_env_from_config(config.provider());
+}
+
+fn resolve_repl_model_provenance(cli_model: &str) -> Result<ModelProvenance, String> {
+    apply_configured_provider_env_for_current_dir();
+    ModelProvenance::from_env_or_config_or_default(cli_model)
+}
+
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
-    Ok(ModelProvenance::from_env_or_config_or_default(&cli_model)?.resolved)
+    Ok(resolve_repl_model_provenance(&cli_model)?.resolved)
+}
+
+fn should_offer_provider_setup_for_repl(cli_model: &str, provenance: &ModelProvenance) -> bool {
+    cli_model == DEFAULT_MODEL && matches!(provenance.source, ModelSource::Default)
+}
+
+fn apply_provider_launch_env(env_map: &HashMap<String, String>) {
+    for (key, value) in env_map {
+        env::set_var(key, value);
+    }
+}
+
+fn resolve_interactive_repl_model(
+    cli_model: String,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let provenance = resolve_repl_model_provenance(&cli_model)?;
+    if !should_offer_provider_setup_for_repl(&cli_model, &provenance) {
+        return Ok(Some(provenance.resolved));
+    }
+
+    println!();
+    println!("No provider or model is configured for bare `claw` yet.");
+    println!("Choose a provider to start the REPL, or run `claw --model MODEL` to bypass setup.");
+    let outcome = setup_wizard::run_setup_wizard()?;
+    let Some(launch) = outcome.launch else {
+        return Ok(None);
+    };
+    apply_provider_launch_env(&launch.env);
+    Ok(Some(resolve_repl_model(launch.model)?))
 }
 
 fn print_model_validation_warning_status(
@@ -3383,9 +3470,7 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
-                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                    return Err("invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>".to_string());
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -3622,11 +3707,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -4059,7 +4140,9 @@ fn tool_spec_to_mcp_tool(spec: tools::ToolSpec) -> McpTool {
 }
 
 /// Build the curated `claw mcp serve --subagents` spec: a purpose-built
-/// `run_subagent` + `list_presets` pair (instead of the entire raw toolbox),
+/// `run_subagent` / `start_subagent` / `get_subagent` / `stop_subagent` /
+/// `list_presets` surface
+/// (instead of the entire raw toolbox),
 /// dispatched through [`tools::handle_subagent_mcp_call`].
 ///
 /// Cross-crate dependency: this calls the tools crate's sub-agent MCP builder
@@ -4070,6 +4153,9 @@ fn tool_spec_to_mcp_tool(spec: tools::ToolSpec) -> McpTool {
 fn build_subagent_mcp_spec() -> McpServerSpec {
     let tools = vec![
         tool_spec_to_mcp_tool(tools::run_subagent_tool_spec()),
+        tool_spec_to_mcp_tool(tools::start_subagent_tool_spec()),
+        tool_spec_to_mcp_tool(tools::get_subagent_tool_spec()),
+        tool_spec_to_mcp_tool(tools::stop_subagent_tool_spec()),
         tool_spec_to_mcp_tool(tools::list_presets_tool_spec()),
     ];
     McpServerSpec {
@@ -4109,13 +4195,77 @@ fn run_subagent_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
     ))
 }
 
+const SUBAGENT_MCP_USAGE: &str = "Usage: claw mcp serve --subagents\n\
+\n\
+Starts a stdio MCP server named claw-subagents exposing exactly:\n\
+  run_subagent     synchronous delegated run\n\
+  start_subagent   pollable background delegated run\n\
+  get_subagent     poll status/activity/read paths\n\
+  stop_subagent    cancel a pollable background run\n\
+  list_presets     list available subagent presets";
+
+fn is_subagent_mcp_help_args(args: &str) -> bool {
+    matches!(
+        args.trim(),
+        "serve --subagents --help"
+            | "serve --subagents -h"
+            | "serve subagents --help"
+            | "serve subagents -h"
+    )
+}
+
 const SUBAGENT_RUN_USAGE: &str = "Usage: claw subagent run --prompt \"<task>\" \
 [--provider openrouter|local|lmstudio|ollama|anthropic|openai|auto] \
 [--model <id>] [--permission-mode read-only|workspace-write|danger-full-access] \
 [--subagent-type Explore|Plan|general-purpose|...] [--repo-dir <dir>] \
-[--max-output-chars <n>] [--timeout-secs <n>] [--preset <name>] [--isolated]\n\
+[--max-output-chars <n>] [--timeout-secs <n>] [--preset <name>] [--isolated] \
+[--review-depth quick|standard|deep|exhaustive] [--focus <areas>] \
+[--artifact-scope diff_only|diff_plus_tests|full_repo_context] \
+[--stop-on-first-blocker] [--require-evidence]\n\
+       claw subagent start --prompt \"<task>\" [same options]\n\
+       claw subagent status <run_id|status_file> [--activity-limit <n>] \
+[--event-limit <n>] [--since-seq <n>] [--stale-after-secs <n>]\n\
+       claw subagent stop <run_id|status_file> [--grace-secs <n>]\n\
 The prompt may also be piped on stdin instead of --prompt. Prints the structured \
 run_subagent JSON result (status/summary/diff_stat/...).";
+
+#[cfg(feature = "subagent_mcp")]
+fn parse_positive_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
+    let parsed: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag} expects a positive integer, got `{raw}`"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} expects a positive integer, got `0`"));
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "subagent_mcp")]
+fn parse_positive_u64_flag(flag: &str, raw: &str) -> Result<u64, String> {
+    let parsed: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag} expects a positive integer, got `{raw}`"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} expects a positive integer, got `0`"));
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "subagent_mcp")]
+fn parse_nonnegative_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
+    raw.trim()
+        .parse()
+        .map_err(|_| format!("{flag} expects a non-negative integer, got `{raw}`"))
+}
+
+#[cfg(feature = "subagent_mcp")]
+fn parse_nonnegative_u64_flag(flag: &str, raw: &str) -> Result<u64, String> {
+    raw.trim()
+        .parse()
+        .map_err(|_| format!("{flag} expects a non-negative integer, got `{raw}`"))
+}
 
 /// Parse the argv tail of `claw subagent run` into the `run_subagent` JSON
 /// argument object. Flags map 1:1 onto `RunSubagentInput` fields.
@@ -4134,6 +4284,9 @@ fn parse_subagent_run_args(args: &[String]) -> Result<Map<String, Value>, String
             "--subagent-type" => Some("subagent_type"),
             "--permission-mode" => Some("permission_mode"),
             "--preset" => Some("preset"),
+            "--review-depth" => Some("review_depth"),
+            "--focus" => Some("focus"),
+            "--artifact-scope" => Some("artifact_scope"),
             _ => None,
         };
         if let Some(key) = string_flag {
@@ -4149,9 +4302,7 @@ fn parse_subagent_run_args(args: &[String]) -> Result<Map<String, Value>, String
                 let raw = args.get(index + 1).ok_or_else(|| {
                     format!("flag `{flag}` requires a value.\n{SUBAGENT_RUN_USAGE}")
                 })?;
-                let parsed: usize = raw.trim().parse().map_err(|_| {
-                    format!("--max-output-chars expects a non-negative integer, got `{raw}`")
-                })?;
+                let parsed = parse_positive_usize_flag("--max-output-chars", raw)?;
                 obj.insert("max_output_chars".into(), Value::from(parsed));
                 index += 2;
             }
@@ -4159,14 +4310,20 @@ fn parse_subagent_run_args(args: &[String]) -> Result<Map<String, Value>, String
                 let raw = args.get(index + 1).ok_or_else(|| {
                     format!("flag `{flag}` requires a value.\n{SUBAGENT_RUN_USAGE}")
                 })?;
-                let parsed: u64 = raw.trim().parse().map_err(|_| {
-                    format!("--timeout-secs expects a non-negative integer, got `{raw}`")
-                })?;
+                let parsed = parse_positive_u64_flag("--timeout-secs", raw)?;
                 obj.insert("timeout_secs".into(), Value::from(parsed));
                 index += 2;
             }
             "--isolated" => {
                 obj.insert("isolated".into(), Value::Bool(true));
+                index += 1;
+            }
+            "--stop-on-first-blocker" => {
+                obj.insert("stop_on_first_blocker".into(), Value::Bool(true));
+                index += 1;
+            }
+            "--require-evidence" => {
+                obj.insert("require_evidence".into(), Value::Bool(true));
                 index += 1;
             }
             other => {
@@ -4179,18 +4336,159 @@ fn parse_subagent_run_args(args: &[String]) -> Result<Map<String, Value>, String
     Ok(obj)
 }
 
-/// Run `claw subagent run`: a headless one-shot wrapper over the curated
-/// `run_subagent` tool. Builds the same JSON input the MCP server accepts,
-/// dispatches through `tools::handle_subagent_mcp_call`, and prints the
-/// structured result so a master/hook can branch on `status`/`summary`.
+#[cfg(feature = "subagent_mcp")]
+fn parse_subagent_status_args(args: &[String]) -> Result<Map<String, Value>, String> {
+    let mut obj = Map::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--activity-limit" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--activity-limit` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed = parse_positive_usize_flag("--activity-limit", raw)?;
+                obj.insert("activity_limit".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--event-limit" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--event-limit` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed = parse_positive_usize_flag("--event-limit", raw)?;
+                obj.insert("event_limit".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--since-seq" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--since-seq` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed = parse_nonnegative_usize_flag("--since-seq", raw)?;
+                obj.insert("since_seq".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--stale-after-secs" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--stale-after-secs` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed = parse_positive_u64_flag("--stale-after-secs", raw)?;
+                obj.insert("stale_after_secs".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--status-file" => {
+                let path = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--status-file` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                obj.insert("status_file".into(), Value::String(path.clone()));
+                index += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!(
+                    "unknown flag `{value}` for `claw subagent status`.\n{SUBAGENT_RUN_USAGE}"
+                ));
+            }
+            value => {
+                if obj.contains_key("run_id") || obj.contains_key("status_file") {
+                    return Err(format!(
+                        "unexpected extra argument `{value}` for `claw subagent status`.\n{SUBAGENT_RUN_USAGE}"
+                    ));
+                }
+                if value.ends_with("status.json") || value.contains('/') {
+                    obj.insert("status_file".into(), Value::String(value.to_string()));
+                } else {
+                    obj.insert("run_id".into(), Value::String(value.to_string()));
+                }
+                index += 1;
+            }
+        }
+    }
+    if !obj.contains_key("run_id") && !obj.contains_key("status_file") {
+        return Err(format!(
+            "missing run id or status file for `claw subagent status`.\n{SUBAGENT_RUN_USAGE}"
+        ));
+    }
+    Ok(obj)
+}
+
+#[cfg(feature = "subagent_mcp")]
+fn parse_subagent_stop_args(args: &[String]) -> Result<Map<String, Value>, String> {
+    let mut obj = Map::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--grace-secs" => {
+                let raw = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--grace-secs` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                let parsed = parse_nonnegative_u64_flag("--grace-secs", raw)?;
+                obj.insert("grace_secs".into(), Value::from(parsed));
+                index += 2;
+            }
+            "--status-file" => {
+                let path = args.get(index + 1).ok_or_else(|| {
+                    format!("flag `--status-file` requires a value.\n{SUBAGENT_RUN_USAGE}")
+                })?;
+                obj.insert("status_file".into(), Value::String(path.clone()));
+                index += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!(
+                    "unknown flag `{value}` for `claw subagent stop`.\n{SUBAGENT_RUN_USAGE}"
+                ));
+            }
+            value => {
+                if obj.contains_key("run_id") || obj.contains_key("status_file") {
+                    return Err(format!(
+                        "unexpected extra argument `{value}` for `claw subagent stop`.\n{SUBAGENT_RUN_USAGE}"
+                    ));
+                }
+                if value.ends_with("status.json") || value.contains('/') {
+                    obj.insert("status_file".into(), Value::String(value.to_string()));
+                } else {
+                    obj.insert("run_id".into(), Value::String(value.to_string()));
+                }
+                index += 1;
+            }
+        }
+    }
+    if !obj.contains_key("run_id") && !obj.contains_key("status_file") {
+        return Err(format!(
+            "missing run id or status file for `claw subagent stop`.\n{SUBAGENT_RUN_USAGE}"
+        ));
+    }
+    Ok(obj)
+}
+
+#[cfg(feature = "subagent_mcp")]
+fn parse_subagent_worker_args(args: &[String]) -> Result<PathBuf, String> {
+    match args {
+        [flag, path] if flag == "--input-file" => Ok(PathBuf::from(path)),
+        _ => Err("Usage: claw subagent run-worker --input-file <path>".to_string()),
+    }
+}
+
+/// Run `claw subagent`: a headless wrapper over the curated subagent tools.
 #[cfg(feature = "subagent_mcp")]
 fn run_subagent_cli(
     args: &[String],
     _output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut rest = args.iter();
-    match rest.next().map(String::as_str) {
-        Some("run") => {}
+    let tool_name = match rest.next().map(String::as_str) {
+        Some("run") => "run_subagent",
+        Some("start") => "start_subagent",
+        Some("status" | "get" | "poll") => "get_subagent",
+        Some("stop" | "cancel") => "stop_subagent",
+        Some("help" | "--help" | "-h") => {
+            println!("{SUBAGENT_RUN_USAGE}");
+            return Ok(());
+        }
+        Some("run-worker") => {
+            let tail: Vec<String> = rest.cloned().collect();
+            let input_file = parse_subagent_worker_args(&tail)?;
+            tools::run_subagent_worker_from_file(&input_file)
+                .map_err(Box::<dyn std::error::Error>::from)?;
+            return Ok(());
+        }
         Some(other) => {
             return Err(Box::<dyn std::error::Error>::from(format!(
                 "unknown `claw subagent` subcommand `{other}`.\n{SUBAGENT_RUN_USAGE}"
@@ -4201,27 +4499,39 @@ fn run_subagent_cli(
                 "missing subcommand for `claw subagent`.\n{SUBAGENT_RUN_USAGE}"
             )));
         }
-    }
+    };
 
     let tail: Vec<String> = rest.cloned().collect();
-    let mut obj = parse_subagent_run_args(&tail)?;
+    if tail
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "help" | "--help" | "-h"))
+    {
+        println!("{SUBAGENT_RUN_USAGE}");
+        return Ok(());
+    }
+    let needs_prompt = matches!(tool_name, "run_subagent" | "start_subagent");
+    let mut obj = match tool_name {
+        "get_subagent" => parse_subagent_status_args(&tail)?,
+        "stop_subagent" => parse_subagent_stop_args(&tail)?,
+        _ => parse_subagent_run_args(&tail)?,
+    };
 
     // Allow the prompt to arrive on stdin when --prompt is absent (e.g. a hook
     // piping an assembled review context).
-    if !obj.contains_key("prompt") {
+    if needs_prompt && !obj.contains_key("prompt") {
         if let Some(piped) = read_piped_stdin() {
             if !piped.trim().is_empty() {
                 obj.insert("prompt".into(), Value::String(piped));
             }
         }
     }
-    if !obj.contains_key("prompt") {
+    if needs_prompt && !obj.contains_key("prompt") {
         return Err(Box::<dyn std::error::Error>::from(format!(
             "no prompt provided: pass --prompt \"<task>\" or pipe it on stdin.\n{SUBAGENT_RUN_USAGE}"
         )));
     }
 
-    let result = tools::handle_subagent_mcp_call("run_subagent", &Value::Object(obj))
+    let result = tools::handle_subagent_mcp_call(tool_name, &Value::Object(obj))
         .map_err(Box::<dyn std::error::Error>::from)?;
     println!("{result}");
     Ok(())
@@ -7314,16 +7624,15 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) => {
-                    // #777: use interactive_only: prefix + \n hint so #776's classify/split
-                    // emits error_kind:interactive_only + non-null hint instead of unknown+null.
-                    // Orchestrators can now detect this and switch to a live REPL instead of retrying.
-                    return Err(format!(
-                        "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
-                    ).into());
-                }
-                _ => {}
+            if let Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) =
+                action.as_deref()
+            {
+                // #777: use interactive_only: prefix + \n hint so #776's classify/split
+                // emits error_kind:interactive_only + non-null hint instead of unknown+null.
+                // Orchestrators can now detect this and switch to a live REPL instead of retrying.
+                return Err(format!(
+                    "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
+                ).into());
             }
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(
@@ -7639,7 +7948,9 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
-    let resolved_model = resolve_repl_model(model)?;
+    let Some(resolved_model) = resolve_interactive_repl_model(model)? else {
+        return Ok(());
+    };
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
@@ -8436,8 +8747,12 @@ impl LiveCli {
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
-                    for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                    for (round, preserve) in preserve_schedule
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .take(max_compact_rounds)
+                    {
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
@@ -9156,6 +9471,10 @@ impl LiveCli {
         // instead of the full toolbox, for parents that orchestrate local /
         // OpenRouter sub-agents.
         match args.map(str::trim) {
+            Some(value) if is_subagent_mcp_help_args(value) => {
+                println!("{SUBAGENT_MCP_USAGE}");
+                return Ok(());
+            }
             Some("serve --subagents") | Some("serve subagents") => {
                 return run_subagent_mcp_serve();
             }
@@ -9214,8 +9533,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -10180,6 +10499,7 @@ fn print_status_snapshot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_json_value(
     model: Option<&str>,
     usage: StatusUsage,
@@ -10676,9 +10996,7 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
-        "ok"
-    } else if status.active {
+    let top_status = if !status.enabled || status.active {
         "ok"
     } else if status.supported {
         "warn"
@@ -11053,6 +11371,7 @@ fn render_doctor_help_json() -> serde_json::Value {
 }
 
 /// #683-#692: extract structured metadata from help prose
+#[allow(clippy::type_complexity)]
 fn extract_help_metadata(
     topic: LocalHelpTopic,
 ) -> (
@@ -14611,39 +14930,37 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
                     } => {
                         // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
                         // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
+                        InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: signature.clone(),
-                        })
+                        }
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -14663,7 +14980,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
-    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(
+        out,
+        "      Start the interactive REPL; first run opens the provider chooser"
+    )?;
     writeln!(
         out,
         "  claw [--model MODEL] [--output-format text|json] prompt [--stdin] [TEXT]"
@@ -14803,6 +15123,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "Examples:")?;
     writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  claw")?;
+    writeln!(out, "  lmcode")?;
+    writeln!(out, "  ollamacode --model qwen3:27b")?;
+    writeln!(out, "  openroutercode")?;
+    writeln!(
+        out,
+        "  run-claw-code --agent qwen3-coder-30b --dir /path/to/repo --plan \"fix the bug\""
+    )?;
     writeln!(
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
@@ -17575,7 +17903,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,
@@ -18029,6 +18357,95 @@ mod tests {
         assert_eq!(resolved, DEFAULT_MODEL);
 
         std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn bare_default_repl_is_the_only_path_that_opens_provider_setup() {
+        let default = super::ModelProvenance::default_fallback();
+        assert!(super::should_offer_provider_setup_for_repl(
+            DEFAULT_MODEL,
+            &default
+        ));
+
+        let explicit = super::ModelProvenance::from_flag("sonnet", "anthropic/claude-sonnet-4-6");
+        assert!(!super::should_offer_provider_setup_for_repl(
+            "anthropic/claude-sonnet-4-6",
+            &explicit
+        ));
+
+        let env_default = super::ModelProvenance::from_resolved(
+            DEFAULT_MODEL,
+            DEFAULT_MODEL,
+            super::ModelSource::Env,
+            Some("CLAW_MODEL"),
+        );
+        assert!(!super::should_offer_provider_setup_for_repl(
+            DEFAULT_MODEL,
+            &env_default
+        ));
+    }
+
+    #[test]
+    fn resolve_repl_model_applies_persisted_openai_provider_env() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+  "provider": {
+    "kind": "openai",
+    "apiKey": "persisted-openai-key",
+    "baseUrl": "http://127.0.0.1:1234/v1"
+  },
+  "model": "qwen3:27b"
+}"#,
+        )
+        .expect("settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_openai_key = std::env::var("OPENAI_API_KEY").ok();
+        let original_openai_base = std::env::var("OPENAI_BASE_URL").ok();
+        let original_resilience = std::env::var("CLAW_RESILIENCE").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("CLAW_RESILIENCE");
+
+        let resolved = with_current_dir(&cwd, || resolve_repl_model(DEFAULT_MODEL.to_string()))
+            .expect("persisted provider config should resolve");
+
+        assert_eq!(resolved, "qwen3:27b");
+        assert_eq!(
+            std::env::var("OPENAI_API_KEY").as_deref(),
+            Ok("persisted-openai-key")
+        );
+        assert_eq!(
+            std::env::var("OPENAI_BASE_URL").as_deref(),
+            Ok("http://127.0.0.1:1234/v1")
+        );
+        assert_eq!(std::env::var("CLAW_RESILIENCE").as_deref(), Ok("force"));
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_openai_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match original_openai_base {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_resilience {
+            Some(value) => std::env::set_var("CLAW_RESILIENCE", value),
+            None => std::env::remove_var("CLAW_RESILIENCE"),
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -20451,7 +20868,7 @@ mod base_url_probe_tests {
         );
         // https scheme defaults to 443 when port absent.
         assert_eq!(
-            parse_base_url_host_port("https://openrouter.ai/api/v1"),
+            parse_base_url_host_port("https://openrouter.ai/api/v1/chat/completions"),
             Some(("openrouter.ai".to_string(), 443, "https".to_string()))
         );
         // Explicit https port is honored.
@@ -20511,7 +20928,7 @@ mod base_url_probe_tests {
             "--provider",
             "openrouter",
             "--model",
-            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-pro:nitro",
             "--permission-mode",
             "read-only",
             "--subagent-type",
@@ -20520,6 +20937,14 @@ mod base_url_probe_tests {
             "/tmp/repo",
             "--max-output-chars",
             "8000",
+            "--review-depth",
+            "deep",
+            "--focus",
+            "correctness,tests",
+            "--artifact-scope",
+            "diff_plus_tests",
+            "--stop-on-first-blocker",
+            "--require-evidence",
             "--isolated",
         ]
         .iter()
@@ -20529,12 +20954,47 @@ mod base_url_probe_tests {
         let obj = super::parse_subagent_run_args(&args).expect("parses");
         assert_eq!(obj["prompt"], "review this diff");
         assert_eq!(obj["provider"], "openrouter");
-        assert_eq!(obj["model"], "deepseek/deepseek-v4-pro");
+        assert_eq!(obj["model"], "deepseek/deepseek-v4-pro:nitro");
         assert_eq!(obj["permission_mode"], "read-only");
         assert_eq!(obj["subagent_type"], "Explore");
         assert_eq!(obj["repo_dir"], "/tmp/repo");
         assert_eq!(obj["max_output_chars"], 8000);
+        assert_eq!(obj["review_depth"], "deep");
+        assert_eq!(obj["focus"], "correctness,tests");
+        assert_eq!(obj["artifact_scope"], "diff_plus_tests");
+        assert_eq!(obj["stop_on_first_blocker"], true);
+        assert_eq!(obj["require_evidence"], true);
         assert_eq!(obj["isolated"], true);
+    }
+
+    #[cfg(feature = "subagent_mcp")]
+    #[test]
+    fn subagent_top_level_parser_preserves_subcommand_flags() {
+        let action = super::parse_args(&[
+            "subagent".to_string(),
+            "start".to_string(),
+            "--provider".to_string(),
+            "openrouter".to_string(),
+            "--model".to_string(),
+            "deepseek/deepseek-v4-pro:nitro".to_string(),
+            "--permission-mode".to_string(),
+            "read-only".to_string(),
+            "--prompt".to_string(),
+            "review".to_string(),
+        ])
+        .expect("subagent args parse");
+
+        match action {
+            super::CliAction::Subagent { args, .. } => {
+                assert!(args.iter().any(|value| value == "--model"));
+                assert!(args
+                    .iter()
+                    .any(|value| value == "deepseek/deepseek-v4-pro:nitro"));
+                assert!(args.iter().any(|value| value == "--permission-mode"));
+                assert!(args.iter().any(|value| value == "read-only"));
+            }
+            other => panic!("expected subagent action, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "subagent_mcp")]
@@ -20546,7 +21006,80 @@ mod base_url_probe_tests {
         let unknown: Vec<String> = vec!["--bogus".to_string()];
         assert!(super::parse_subagent_run_args(&unknown).is_err());
 
+        let removed_iterations_flag: Vec<String> =
+            vec!["--max-iterations".to_string(), "4".to_string()];
+        assert!(super::parse_subagent_run_args(&removed_iterations_flag).is_err());
+
         let bad_num: Vec<String> = vec!["--max-output-chars".to_string(), "notanumber".to_string()];
         assert!(super::parse_subagent_run_args(&bad_num).is_err());
+
+        let zero_output: Vec<String> = vec!["--max-output-chars".to_string(), "0".to_string()];
+        assert!(super::parse_subagent_run_args(&zero_output).is_err());
+
+        let zero_timeout: Vec<String> = vec!["--timeout-secs".to_string(), "0".to_string()];
+        assert!(super::parse_subagent_run_args(&zero_timeout).is_err());
+    }
+
+    #[cfg(feature = "subagent_mcp")]
+    #[test]
+    fn subagent_status_args_accept_run_id_or_status_file() {
+        let by_id = super::parse_subagent_status_args(&[
+            "subagent-123".to_string(),
+            "--activity-limit".to_string(),
+            "5".to_string(),
+            "--event-limit".to_string(),
+            "7".to_string(),
+            "--since-seq".to_string(),
+            "9".to_string(),
+            "--stale-after-secs".to_string(),
+            "300".to_string(),
+        ])
+        .expect("status args parse");
+        assert_eq!(by_id["run_id"], "subagent-123");
+        assert_eq!(by_id["activity_limit"], 5);
+        assert_eq!(by_id["event_limit"], 7);
+        assert_eq!(by_id["since_seq"], 9);
+        assert_eq!(by_id["stale_after_secs"], 300);
+
+        let by_file = super::parse_subagent_status_args(&[
+            "--status-file".to_string(),
+            "/tmp/run/status.json".to_string(),
+        ])
+        .expect("status file args parse");
+        assert_eq!(by_file["status_file"], "/tmp/run/status.json");
+
+        let zero_limit = super::parse_subagent_status_args(&[
+            "subagent-123".to_string(),
+            "--activity-limit".to_string(),
+            "0".to_string(),
+        ]);
+        assert!(zero_limit.is_err());
+    }
+
+    #[cfg(feature = "subagent_mcp")]
+    #[test]
+    fn subagent_stop_args_accept_run_id_or_status_file() {
+        let by_id = super::parse_subagent_stop_args(&[
+            "subagent-123".to_string(),
+            "--grace-secs".to_string(),
+            "0".to_string(),
+        ])
+        .expect("stop args parse");
+        assert_eq!(by_id["run_id"], "subagent-123");
+        assert_eq!(by_id["grace_secs"], 0);
+
+        let by_file = super::parse_subagent_stop_args(&[
+            "--status-file".to_string(),
+            "/tmp/run/status.json".to_string(),
+        ])
+        .expect("stop status file args parse");
+        assert_eq!(by_file["status_file"], "/tmp/run/status.json");
+    }
+
+    #[test]
+    fn subagent_mcp_help_args_are_recognized() {
+        assert!(super::is_subagent_mcp_help_args("serve --subagents --help"));
+        assert!(super::is_subagent_mcp_help_args("serve subagents -h"));
+        assert!(!super::is_subagent_mcp_help_args("serve --subagents"));
     }
 }

@@ -1,0 +1,8 @@
+[mcp_servers.claw-subagents]
+command = "claw"
+args = [
+    "mcp",
+    "serve",
+    "--subagents",
+]
+env_vars = ["OPENROUTER_API_KEY"]

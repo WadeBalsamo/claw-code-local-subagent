@@ -441,7 +441,7 @@ fi
 
 case "$PROVIDER" in
   openrouter)
-    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}"
+    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://openrouter.ai/api/v1/chat/completions}"
     if [ -z "${OPENAI_API_KEY:-}" ]; then
       for _env_file in "$HOME/.config/openroutercode/.env" "$HOME/.config/opencode/.env"; do
         if [ -f "$_env_file" ]; then

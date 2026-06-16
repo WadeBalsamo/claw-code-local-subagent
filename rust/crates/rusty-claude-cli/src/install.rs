@@ -275,7 +275,7 @@ mod tests {
         );
         // A known line from the openrouter launcher body survives.
         assert!(
-            rendered.contains("https://openrouter.ai/api/v1"),
+            rendered.contains("https://openrouter.ai/api/v1/chat/completions"),
             "missing openrouter body content:\n{rendered}"
         );
         // The export comes before the embedded body content.
@@ -283,7 +283,7 @@ mod tests {
             .find("export CLAW_CODE_ROOT=")
             .expect("export present");
         let body_idx = rendered
-            .find("https://openrouter.ai/api/v1")
+            .find("https://openrouter.ai/api/v1/chat/completions")
             .expect("body present");
         assert!(export_idx < body_idx, "export should precede body");
     }

@@ -243,6 +243,34 @@ const ADVERSARIAL_REVIEW_FIELDS: &[FieldSpec] = &[
         name: "timeoutSecs",
         expected: FieldType::Number,
     },
+    FieldSpec {
+        name: "staleAfterSecs",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "pollSecs",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "reviewDepth",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "focus",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "artifactScope",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "stopOnFirstBlocker",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "requireEvidence",
+        expected: FieldType::Bool,
+    },
     // Token cap on the conversation context summarized and sent to the reviewer.
     FieldSpec {
         name: "contextMaxTokens",
@@ -692,7 +720,7 @@ mod tests {
     #[test]
     fn accepts_known_adversarial_review_keys() {
         // given
-        let source = r#"{"adversarialReview": {"enabled": true, "model": "deepseek/deepseek-v4-pro", "contextMaxTokens": 25000, "contextThresholdTokens": 3000, "timeoutSecs": 180}}"#;
+        let source = r#"{"adversarialReview": {"enabled": true, "model": "deepseek/deepseek-v4-pro:nitro", "contextMaxTokens": 25000, "contextThresholdTokens": 3000, "timeoutSecs": 180, "staleAfterSecs": 300, "pollSecs": 15, "reviewDepth": "deep", "focus": "correctness,tests", "artifactScope": "diff_plus_tests", "stopOnFirstBlocker": false, "requireEvidence": true}}"#;
         let parsed = JsonValue::parse(source).expect("valid json");
         let object = parsed.as_object().expect("object");
 
